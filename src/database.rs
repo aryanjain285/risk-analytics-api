@@ -52,9 +52,9 @@ impl DatabaseQueries {
               WHERE date = $2",
 
             price_series_streaming: "SELECT date, price FROM portfolio_prices 
-               WHERE portfolio_id = $1 AND date BETWEEN $2 AND $3 
+               WHERE portfolio_id = $1 AND date >= $2 AND date <= $3
                ORDER BY date
-               LIMIT $4 OFFSET $5", // Pagination for huge datasets
+               LIMIT $4", // Keyset pagination for huge datasets
 
             batch_portfolio_prices: "SELECT portfolio_id, date, price 
                FROM portfolio_prices 
@@ -137,22 +137,13 @@ impl Database {
             .await
             .context("Failed to create database connection pool")?;
 
-        // Test connection and log database stats
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM portfolio_prices")
-            .fetch_one(&pool)
+        // Simple connectivity test - much faster than COUNT(*)
+        sqlx::query("SELECT 1")
+            .execute(&pool)
             .await
             .context("Failed to test database connection")?;
 
-        info!("📊 Database contains {} portfolio price records", row.0);
-
-        // Analyze table for query optimization
-        sqlx::query("ANALYZE portfolio_prices")
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Could not analyze portfolio_prices table: {}", e);
-                sqlx::postgres::PgQueryResult::default()
-            });
+        info!("📊 Database connection established successfully");
 
         Ok(Self {
             pool,
@@ -178,49 +169,58 @@ impl Database {
         Ok(result)
     }
 
-    /// Get portfolio price series with streaming for massive datasets
+    /// Get portfolio price series with keyset pagination for massive datasets
     pub async fn get_portfolio_price_series(
         &self,
         portfolio_id: &str,
         start_date: NaiveDate,
         end_date: NaiveDate,
     ) -> Result<Vec<(NaiveDate, f64)>> {
-        // For massive datasets, we might need pagination
-        const CHUNK_SIZE: i64 = 10000;
+        // Use streaming with keyset pagination - much faster than OFFSET
         let mut all_data = Vec::new();
-        let mut offset = 0i64;
+        let mut last_date = start_date;
+        const CHUNK_SIZE: i64 = 10000;
 
         loop {
-            let chunk = sqlx::query(
+            // Stream data instead of materializing with fetch_all
+            use futures::TryStreamExt;
+            
+            let mut rows = sqlx::query(
                 "SELECT date, price FROM portfolio_prices 
-               WHERE portfolio_id = $1 AND date BETWEEN $2 AND $3 
+               WHERE portfolio_id = $1 AND date >= $2 AND date <= $3
                ORDER BY date
-               LIMIT $4 OFFSET $5"
+               LIMIT $4"
             )
             .bind(portfolio_id)
-            .bind(start_date)
+            .bind(last_date)
             .bind(end_date)
-            .bind(CHUNK_SIZE as i64)
-            .bind(offset as i64)
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to fetch portfolio price series")?;
+            .bind(CHUNK_SIZE)
+            .fetch(&self.pool);
 
-            if chunk.is_empty() {
-                break;
-            }
+            let mut chunk_data = Vec::new();
+            let mut row_count = 0;
 
-            all_data.extend(chunk.iter().map(|row| {
+            while let Some(row) = rows.try_next().await.context("Failed to fetch portfolio price series")? {
                 let date: NaiveDate = row.get("date");
                 let price: f64 = row.get("price");
-                (date, price)
-            }));
+                chunk_data.push((date, price));
+                row_count += 1;
+            }
 
-            if chunk.len() < CHUNK_SIZE as usize {
+            if chunk_data.is_empty() {
                 break;
             }
 
-            offset += CHUNK_SIZE;
+            // Update last_date for next iteration (keyset pagination)
+            if let Some((last_row_date, _)) = chunk_data.last() {
+                last_date = *last_row_date + chrono::Duration::days(1);
+            }
+
+            all_data.extend(chunk_data);
+
+            if row_count < CHUNK_SIZE as usize {
+                break;
+            }
         }
 
         Ok(all_data)
@@ -269,8 +269,11 @@ impl Database {
         start_date: NaiveDate,
         end_date: NaiveDate,
     ) -> Result<(Vec<f64>, Vec<f64>)> {
-        // Single query to get both portfolios' aligned data - MUCH faster than separate queries
-        let rows = sqlx::query(
+        // Stream aligned data using fetch() instead of fetch_all() for memory efficiency
+        use sqlx::Row;
+        use futures::TryStreamExt;
+
+        let mut rows = sqlx::query(
             r#"
           WITH p1_data AS (
               SELECT date, price as p1_price
@@ -291,14 +294,12 @@ impl Database {
         .bind(portfolio_id2)
         .bind(start_date)
         .bind(end_date)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to fetch aligned portfolio data")?;
+        .fetch(&self.pool);
 
-        let mut prices1 = Vec::with_capacity(rows.len());
-        let mut prices2 = Vec::with_capacity(rows.len());
+        let mut prices1 = Vec::new();
+        let mut prices2 = Vec::new();
 
-        for row in rows {
+        while let Some(row) = rows.try_next().await.context("Failed to fetch aligned portfolio data")? {
             let p1_price: f64 = row.get("p1_price");
             let p2_price: f64 = row.get("p2_price");
             prices1.push(p1_price);
@@ -308,7 +309,7 @@ impl Database {
         Ok((prices1, prices2))
     }
 
-    /// Stream large price series in chunks to avoid memory issues
+    /// Stream large price series in chunks with keyset pagination
     pub async fn stream_price_series_chunked<F, Fut>(
         &self,
         portfolio_id: &str,
@@ -321,43 +322,49 @@ impl Database {
         F: Fn(Vec<(NaiveDate, f64)>) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        let mut offset = 0i64;
+        let mut last_date = start_date;
         let chunk_size = chunk_size as i64;
 
         loop {
-            let chunk = sqlx::query(
+            // Stream chunks instead of materializing with fetch_all
+            use futures::TryStreamExt;
+            
+            let mut rows = sqlx::query(
                 "SELECT date, price FROM portfolio_prices 
-               WHERE portfolio_id = $1 AND date BETWEEN $2 AND $3 
+               WHERE portfolio_id = $1 AND date >= $2 AND date <= $3
                ORDER BY date
-               LIMIT $4 OFFSET $5"
+               LIMIT $4"
             )
             .bind(portfolio_id)
-            .bind(start_date)
+            .bind(last_date)
             .bind(end_date)
             .bind(chunk_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to fetch price series chunk")?;
+            .fetch(&self.pool);
 
-            if chunk.is_empty() {
+            let mut chunk_data = Vec::new();
+            let mut row_count = 0;
+
+            while let Some(row) = rows.try_next().await.context("Failed to fetch price series chunk")? {
+                let date: NaiveDate = row.get("date");
+                let price: f64 = row.get("price");
+                chunk_data.push((date, price));
+                row_count += 1;
+            }
+
+            if chunk_data.is_empty() {
                 break;
             }
 
-            let chunk_data: Vec<(NaiveDate, f64)> =
-                chunk.iter().map(|row| {
-                    let date: NaiveDate = row.get("date");
-                    let price: f64 = row.get("price");
-                    (date, price)
-                }).collect();
+            // Update last_date for next iteration
+            if let Some((last_row_date, _)) = chunk_data.last() {
+                last_date = *last_row_date + chrono::Duration::days(1);
+            }
 
             processor(chunk_data).await?;
 
-            if chunk.len() < chunk_size as usize {
+            if row_count < chunk_size as usize {
                 break;
             }
-
-            offset += chunk_size;
         }
 
         Ok(())

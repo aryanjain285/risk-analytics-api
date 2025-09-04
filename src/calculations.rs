@@ -10,59 +10,67 @@ use chrono::NaiveDate;
 pub struct SIMDFinancialCalculator;
 
 impl SIMDFinancialCalculator {
-    /// Calculate daily returns with SIMD vectorization - handles millions of data points
+    /// Calculate daily returns optimized - zero extra allocations
     #[inline(always)]
     pub fn daily_returns_simd(prices: &[f64]) -> Vec<f64> {
-        if prices.len() < 2 {
+        let n = prices.len();
+        if n < 2 {
             return Vec::new();
         }
 
-        let mut returns = Vec::with_capacity(prices.len() - 1);
-        let windows: Vec<_> = prices.windows(2).collect();
-
+        let mut returns = vec![0.0; n - 1];
+        
         // For massive datasets, use parallel processing
-        if windows.len() > 10_000 {
-            return windows
-                .par_iter()
-                .map(|window| (window[1] - window[0]) / window[0])
-                .collect();
+        if n > 10_000 {
+            returns.par_iter_mut().enumerate().for_each(|(i, ret)| {
+                let prev = prices[i];
+                let curr = prices[i + 1];
+                *ret = if prev != 0.0 { (curr - prev) / prev } else { 0.0 };
+            });
+        } else {
+            // Scalar version for smaller datasets
+            for i in 1..n {
+                let prev = prices[i - 1];
+                let curr = prices[i];
+                returns[i - 1] = if prev != 0.0 { (curr - prev) / prev } else { 0.0 };
+            }
         }
-
-        // Process in chunks for better cache performance
-        returns = windows
-            .par_iter()
-            .map(|window| (window[1] - window[0]) / window[0])
-            .collect();
 
         returns
     }
 
-    /// Lightning-fast volatility calculation with incremental updates
+    /// Lightning-fast volatility calculation - one-pass algorithm
     #[inline(always)]
     pub fn volatility_optimized(returns: &[f64]) -> f64 {
-        if returns.len() < 2 {
+        let n = returns.len() as f64;
+        if n < 2.0 {
             return 0.0;
         }
 
-        // For massive datasets, use parallel processing
-        if returns.len() > 50_000 {
-            let mean: f64 = returns.par_iter().sum::<f64>() / returns.len() as f64;
-            let variance: f64 = returns
-                .par_iter()
-                .map(|&x| {
-                    let diff = x - mean;
-                    diff * diff
-                })
-                .sum::<f64>()
-                / (returns.len() - 1) as f64;
+        // One-pass parallel variance calculation
+        let (sum, sumsq) = if returns.len() > 50_000 {
+            returns.par_chunks(1 << 15).map(|chunk| {
+                let mut s = 0.0;
+                let mut ss = 0.0;
+                for &x in chunk {
+                    s += x;
+                    ss += x * x;
+                }
+                (s, ss)
+            }).reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1))
+        } else {
+            let mut s = 0.0;
+            let mut ss = 0.0;
+            for &x in returns {
+                s += x;
+                ss += x * x;
+            }
+            (s, ss)
+        };
 
-            return variance.sqrt() * (252.0_f64).sqrt();
-        }
-
-        // For smaller datasets, use nalgebra with SIMD
-        let vector = DVector::from_row_slice(returns);
-        let std_dev = vector.variance().sqrt();
-        std_dev * (252.0_f64).sqrt() // Annualize
+        let mean = sum / n;
+        let variance = (sumsq / n) - mean * mean;
+        variance.max(0.0).sqrt() * 252.0f64.sqrt()
     }
 
     /// Ultra-fast correlation with SIMD operations
@@ -135,32 +143,38 @@ impl SIMDFinancialCalculator {
         }
     }
 
-    /// Tracking error calculation optimized for large datasets
+    /// Tracking error without building excess_returns vector
     #[inline(always)]
     pub fn tracking_error_optimized(portfolio_returns: &[f64], benchmark_returns: &[f64]) -> f64 {
         if portfolio_returns.len() != benchmark_returns.len() || portfolio_returns.is_empty() {
             return 0.0;
         }
 
-        // For massive datasets, use parallel processing
-        if portfolio_returns.len() > 50_000 {
-            let excess_returns: Vec<f64> = portfolio_returns
-                .par_iter()
-                .zip(benchmark_returns.par_iter())
-                .map(|(&p, &b)| p - b)
-                .collect();
-
-            return Self::volatility_optimized(&excess_returns);
+        let n = portfolio_returns.len() as f64;
+        if n < 2.0 {
+            return 0.0;
         }
 
-        // Calculate excess returns using vectorized operations
-        let excess_returns: Vec<f64> = portfolio_returns
-            .iter()
-            .zip(benchmark_returns.iter())
-            .map(|(p, b)| p - b)
-            .collect();
+        // Calculate variance of excess returns directly without temp vector
+        let (sum, sumsq) = if portfolio_returns.len() > 50_000 {
+            portfolio_returns.par_iter().zip(benchmark_returns.par_iter()).map(|(&p, &b)| {
+                let excess = p - b;
+                (excess, excess * excess)
+            }).reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1))
+        } else {
+            let mut s = 0.0;
+            let mut ss = 0.0;
+            for (&p, &b) in portfolio_returns.iter().zip(benchmark_returns.iter()) {
+                let excess = p - b;
+                s += excess;
+                ss += excess * excess;
+            }
+            (s, ss)
+        };
 
-        Self::volatility_optimized(&excess_returns)
+        let mean = sum / n;
+        let variance = (sumsq / n) - mean * mean;
+        variance.max(0.0).sqrt() * 252.0f64.sqrt()
     }
 
     /// Cumulative return calculation - handles massive time series
@@ -173,7 +187,28 @@ impl SIMDFinancialCalculator {
         let start_price = prices[0].1;
         let end_price = prices[prices.len() - 1].1;
 
-        (end_price - start_price) / start_price
+        if start_price != 0.0 {
+            (end_price - start_price) / start_price
+        } else {
+            0.0
+        }
+    }
+
+    /// Cumulative return from price vector (for handlers)
+    #[inline(always)]
+    pub fn cumulative_return_from_prices(prices: &[f64]) -> f64 {
+        if prices.len() < 2 {
+            return 0.0;
+        }
+
+        let start_price = prices[0];
+        let end_price = prices[prices.len() - 1];
+
+        if start_price != 0.0 {
+            (end_price - start_price) / start_price
+        } else {
+            0.0
+        }
     }
 
     /// Memory-efficient streaming calculations for massive datasets

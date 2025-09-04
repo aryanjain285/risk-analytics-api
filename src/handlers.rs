@@ -179,7 +179,15 @@ pub async fn nuclear_cumulative_return(
         .get_price_series_l2(&query.portfolio_id, query.start_date, query.end_date)
         .await
     {
-        let cumulative_return = SIMDFinancialCalculator::cumulative_return(&price_series);
+        let price_values: Vec<f64> = price_series.iter().map(|(_, price)| *price).collect();
+        let cumulative_return = tokio::task::spawn_blocking(move || {
+            SIMDFinancialCalculator::cumulative_return_from_prices(&price_values)
+        }).await.map_err(|_| {
+            error!("CPU task panicked during cumulative return calculation");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                error: "Internal server error".to_string(),
+            }))
+        })?;
         debug!("⚡ L2 cache hit for price series");
 
         return Ok(Json(CumulativeReturnResponse {
@@ -195,7 +203,15 @@ pub async fn nuclear_cumulative_return(
         .await
     {
         Ok(price_series) if price_series.len() >= 2 => {
-            let cumulative_return = SIMDFinancialCalculator::cumulative_return(&price_series);
+            let price_values: Vec<f64> = price_series.iter().map(|(_, price)| *price).collect();
+            let cumulative_return = tokio::task::spawn_blocking(move || {
+                SIMDFinancialCalculator::cumulative_return_from_prices(&price_values)
+            }).await.map_err(|_| {
+                error!("CPU task panicked during cumulative return calculation");
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }))
+            })?;
 
             // Cache the price series for future use
             state
@@ -309,10 +325,18 @@ pub async fn nuclear_daily_volatility(
         ));
     }
 
-    // SIMD-optimized calculation
+    // SIMD-optimized calculation offloaded to thread pool
     let prices: Vec<f64> = price_series.iter().map(|(_, price)| *price).collect();
-    let returns = SIMDFinancialCalculator::daily_returns_simd(&prices);
-    let volatility = SIMDFinancialCalculator::volatility_optimized(&returns);
+    let (returns, volatility) = tokio::task::spawn_blocking(move || {
+        let returns = SIMDFinancialCalculator::daily_returns_simd(&prices);
+        let volatility = SIMDFinancialCalculator::volatility_optimized(&returns);
+        (returns, volatility)
+    }).await.map_err(|_| {
+        error!("CPU task panicked during volatility calculation");
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: "Internal server error".to_string(),
+        }))
+    })?;
 
     // Create rolling volatility for future incremental updates
     let rolling_vol = RollingVolatility::new(&returns);
@@ -371,10 +395,17 @@ pub async fn nuclear_correlation(
         .await
     {
         Ok((prices1, prices2)) if prices1.len() >= 2 && prices2.len() >= 2 => {
-            // SIMD-optimized correlation calculation
-            let returns1 = SIMDFinancialCalculator::daily_returns_simd(&prices1);
-            let returns2 = SIMDFinancialCalculator::daily_returns_simd(&prices2);
-            let correlation = SIMDFinancialCalculator::correlation_simd(&returns1, &returns2);
+            // SIMD-optimized correlation calculation offloaded to thread pool
+            let correlation = tokio::task::spawn_blocking(move || {
+                let returns1 = SIMDFinancialCalculator::daily_returns_simd(&prices1);
+                let returns2 = SIMDFinancialCalculator::daily_returns_simd(&prices2);
+                SIMDFinancialCalculator::correlation_simd(&returns1, &returns2)
+            }).await.map_err(|_| {
+                error!("CPU task panicked during correlation calculation");
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }))
+            })?;
 
             // Cache the result
             state.cache.cache_correlation(
@@ -438,13 +469,20 @@ pub async fn nuclear_tracking_error(
         .await
     {
         Ok((portfolio_prices, benchmark_prices)) if portfolio_prices.len() >= 2 => {
-            // SIMD-optimized tracking error calculation
-            let portfolio_returns = SIMDFinancialCalculator::daily_returns_simd(&portfolio_prices);
-            let benchmark_returns = SIMDFinancialCalculator::daily_returns_simd(&benchmark_prices);
-            let tracking_error = SIMDFinancialCalculator::tracking_error_optimized(
-                &portfolio_returns,
-                &benchmark_returns,
-            );
+            // SIMD-optimized tracking error calculation offloaded to thread pool
+            let tracking_error = tokio::task::spawn_blocking(move || {
+                let portfolio_returns = SIMDFinancialCalculator::daily_returns_simd(&portfolio_prices);
+                let benchmark_returns = SIMDFinancialCalculator::daily_returns_simd(&benchmark_prices);
+                SIMDFinancialCalculator::tracking_error_optimized(
+                    &portfolio_returns,
+                    &benchmark_returns,
+                )
+            }).await.map_err(|_| {
+                error!("CPU task panicked during tracking error calculation");
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }))
+            })?;
 
             debug!("📊 Tracking error calculated: {}", tracking_error);
             Ok(Json(TrackingErrorResponse {
