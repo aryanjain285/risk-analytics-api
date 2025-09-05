@@ -72,19 +72,36 @@ impl DatabaseQueries {
             "#,
 
             // Get aligned portfolio data for correlation/tracking error
+            // Enhanced to handle both leaf and summary portfolios properly
             aligned_portfolios: r#"
-                WITH p1_values AS (
+                WITH RECURSIVE portfolio_tree AS (
+                    -- Base case: direct portfolio
+                    SELECT portfolio_id, portfolio_id as root_portfolio, portfolio_type
+                    FROM portfolios 
+                    WHERE portfolio_id IN ($1, $2)
+                    
+                    UNION ALL
+                    
+                    -- Recursive case: child portfolios
+                    SELECT p.portfolio_id, pt.root_portfolio, p.portfolio_type
+                    FROM portfolios p
+                    INNER JOIN portfolio_tree pt ON p.parent_portfolio_id = pt.portfolio_id
+                    WHERE p.portfolio_type = 'leaf'
+                ),
+                p1_values AS (
                     SELECT h.date, SUM(h.quantity * p.closing_price) as portfolio1_value
                     FROM holdings h
                     JOIN prices p ON h.symbol = p.symbol AND h.date = p.date
-                    WHERE h.portfolio_id = $1 AND h.date BETWEEN $3 AND $4
+                    INNER JOIN portfolio_tree pt1 ON h.portfolio_id = pt1.portfolio_id
+                    WHERE pt1.root_portfolio = $1 AND h.date BETWEEN $3 AND $4
                     GROUP BY h.date
                 ),
                 p2_values AS (
                     SELECT h.date, SUM(h.quantity * p.closing_price) as portfolio2_value
                     FROM holdings h
                     JOIN prices p ON h.symbol = p.symbol AND h.date = p.date
-                    WHERE h.portfolio_id = $2 AND h.date BETWEEN $3 AND $4
+                    INNER JOIN portfolio_tree pt2 ON h.portfolio_id = pt2.portfolio_id
+                    WHERE pt2.root_portfolio = $2 AND h.date BETWEEN $3 AND $4
                     GROUP BY h.date
                 )
                 SELECT p1.date, p1.portfolio1_value, p2.portfolio2_value
@@ -601,10 +618,10 @@ impl Database {
             .context("Failed to fetch benchmark data")?
         {
             let date: NaiveDate = row.get("date");
-            let return_value_raw: i32 = row.get("bmk_returns");
-            // Convert integer to float (seems to be stored as scaled values)
-            let return_value: f64 = return_value_raw as f64 / 10000000.0; // Convert to decimal percentage
-            benchmark_series.push((date, return_value));
+            let benchmark_value: i32 = row.get("bmk_returns");
+            // bmk_returns are benchmark VALUES (not returns), convert to f64 properly
+            let benchmark_value_f64: f64 = benchmark_value as f64;
+            benchmark_series.push((date, benchmark_value_f64));
         }
 
         Ok(benchmark_series)

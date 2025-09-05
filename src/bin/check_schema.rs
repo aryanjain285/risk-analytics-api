@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .username("team9dbuser.jdcgkhwtrsdhyysagkwb")
         .password("e5ci7swfjroiqs4f")
         .database("postgres")
-        .ssl_mode(sqlx::postgres::PgSslMode::Require);
+        .ssl_mode(sqlx::postgres::PgSslMode::Prefer);
 
     println!("Connecting to database...");
     let mut conn = PgConnection::connect_with(&options).await?;

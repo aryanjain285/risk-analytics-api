@@ -381,16 +381,26 @@ pub async fn get_cumulative_return(
                 ));
             }
 
-            // Calculate cumulative return: (final_value / initial_value) - 1
+            // Calculate cumulative return using compound formula: ∏(1+Rp,ti) - 1
             let cumulative_return = if price_series.len() >= 2 {
-                let initial_value = price_series[0].1;
-                let final_value = price_series[price_series.len() - 1].1;
-
-                if initial_value != 0.0 {
-                    (final_value / initial_value) - 1.0
-                } else {
-                    0.0
-                }
+                // Extract prices for calculation
+                let prices: Vec<f64> = price_series.iter().map(|(_, price)| *price).collect();
+                
+                // Calculate using SIMD financial calculator compound formula
+                tokio::task::spawn_blocking(move || {
+                    SIMDFinancialCalculator::cumulative_return_from_prices(&prices)
+                })
+                .await
+                .map_err(|_| {
+                    error!("CPU task panicked during cumulative return calculation");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "Internal server error".to_string(),
+                            code: "CALCULATION_ERROR".to_string(),
+                        }),
+                    )
+                })?
             } else if price_series.len() == 1 {
                 0.0 // No change if only one data point
             } else {
@@ -493,10 +503,13 @@ pub async fn get_daily_volatility(
         }));
     }
 
-    // Fetch price series and calculate volatility
+    // Fetch price series starting from day before start_date to calculate returns properly
+    // As per spec: "The start date is inclusive in the calculation (eg, it should look for the portfolio price from start date – 1)"
+    let extended_start_date = start_date - chrono::Duration::days(1);
+    
     match state
         .db
-        .get_portfolio_price_series(&params.portfolio_id, start_date, end_date)
+        .get_portfolio_price_series(&params.portfolio_id, extended_start_date, end_date)
         .await
     {
         Ok(price_series) => {
@@ -621,12 +634,15 @@ pub async fn get_correlation(
     }
 
     // Fetch aligned price data for both portfolios
+    // Include previous day to calculate returns properly (as per spec: start date is inclusive)
+    let extended_start_date = start_date - chrono::Duration::days(1);
+    
     match state
         .db
         .get_aligned_price_series_parallel(
             &params.portfolio_id1,
             &params.portfolio_id2,
-            start_date,
+            extended_start_date,
             end_date,
         )
         .await
@@ -757,14 +773,17 @@ pub async fn get_tracking_error(
     }
 
     // Fetch portfolio returns and benchmark returns separately
+    // Include previous day to calculate returns properly (as per spec: start date is inclusive)  
+    let extended_start_date = start_date - chrono::Duration::days(1);
+    
     let portfolio_prices_result = state
         .db
-        .get_portfolio_price_series(&params.portfolio_id, start_date, end_date)
+        .get_portfolio_price_series(&params.portfolio_id, extended_start_date, end_date)
         .await;
     
     let benchmark_returns_result = state
         .db
-        .get_benchmark_returns(&params.benchmark_id, start_date, end_date)
+        .get_benchmark_returns(&params.benchmark_id, extended_start_date, end_date)
         .await;
     
     match (portfolio_prices_result, benchmark_returns_result) {
