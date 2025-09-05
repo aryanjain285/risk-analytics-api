@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         let cache = cache.clone();
         async move {
             info!("🔥 Pre-warming cache for optimal performance...");
-            cache.warm_cache(&db).await.unwrap_or_else(|e| {
+            cache.warm_cache_intelligently(&db).await.unwrap_or_else(|e| {
                 warn!("Cache warming failed: {}", e);
             });
             info!("✅ Cache warming completed");

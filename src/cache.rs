@@ -215,6 +215,20 @@ pub struct NuclearCache {
     pub l2_price_series: Cache<String, Vec<(NaiveDate, f64)>>,
     pub l2_calculations: Cache<String, f64>,
 
+    // L0 Cache: Raw data building blocks (longest TTL)
+    pub portfolio_hierarchy: Arc<DashMap<String, CacheEntry<Vec<i32>>>>,  // children portfolios
+    pub portfolio_holdings: Arc<DashMap<String, CacheEntry<Vec<(String, f64)>>>>, // symbol, quantity
+    pub symbol_prices: Arc<DashMap<String, CacheEntry<f64>>>,  // symbol:date -> price
+    pub portfolio_types: Arc<DashMap<String, CacheEntry<String>>>, // id -> "leaf" or "summary"
+    
+    // Intermediate Cache: Pre-calculated building blocks
+    pub symbol_values: Arc<DashMap<String, CacheEntry<f64>>>,  // portfolio:symbol:date -> value
+    pub child_values: Arc<DashMap<String, CacheEntry<f64>>>,   // child_id:date -> total_value
+    
+    // Batch Cache: Date ranges and price series
+    pub date_range_cache: Cache<String, Vec<(NaiveDate, f64)>>,
+    pub bulk_calculations: Cache<String, Vec<f64>>,
+
     // Hot data pre-loading for common portfolios
     pub hot_portfolios: Arc<DashMap<String, Instant>>,
 
@@ -239,6 +253,19 @@ impl NuclearCache {
             .time_to_idle(Duration::from_secs(120)) // 2 minute idle timeout
             .build();
 
+        // Date range and bulk calculation cache  
+        let date_range_cache = Cache::builder()
+            .max_capacity(5_000) // 5K date ranges
+            .time_to_live(Duration::from_secs(1800)) // 30 minute TTL
+            .time_to_idle(Duration::from_secs(300)) // 5 minute idle timeout
+            .build();
+
+        let bulk_calculations = Cache::builder()
+            .max_capacity(25_000) // 25K bulk calculations
+            .time_to_live(Duration::from_secs(900)) // 15 minute TTL
+            .time_to_idle(Duration::from_secs(180)) // 3 minute idle timeout
+            .build();
+
         Ok(Self {
             // L1 Caches with high capacity for massive datasets
             portfolio_prices: Arc::new(DashMap::with_capacity(100_000)),
@@ -251,6 +278,20 @@ impl NuclearCache {
             // L2 Caches
             l2_price_series,
             l2_calculations,
+
+            // L0 Raw Data Caches (longest TTL)
+            portfolio_hierarchy: Arc::new(DashMap::with_capacity(10_000)),
+            portfolio_holdings: Arc::new(DashMap::with_capacity(500_000)), // massive holdings cache
+            symbol_prices: Arc::new(DashMap::with_capacity(1_000_000)), // price per symbol per date
+            portfolio_types: Arc::new(DashMap::with_capacity(10_000)),
+            
+            // Intermediate Caches
+            symbol_values: Arc::new(DashMap::with_capacity(2_000_000)), // symbol values per portfolio per date
+            child_values: Arc::new(DashMap::with_capacity(50_000)), // child portfolio values
+            
+            // Batch Caches
+            date_range_cache,
+            bulk_calculations,
 
             // Hot data tracking
             hot_portfolios: Arc::new(DashMap::with_capacity(1_000)),
@@ -605,6 +646,233 @@ impl NuclearCache {
                 0.0
             },
         }
+    }
+
+    // ---------------------------
+    // L0: Raw Data Building Blocks
+    // ---------------------------
+    
+    /// Cache portfolio hierarchy (children)
+    pub async fn cache_portfolio_hierarchy(&self, portfolio_id: &str, children: Vec<i32>) {
+        self.portfolio_hierarchy.insert(
+            portfolio_id.to_string(), 
+            CacheEntry::new(children)
+        );
+    }
+    
+    /// Get portfolio hierarchy from cache
+    pub async fn get_portfolio_hierarchy(&self, portfolio_id: &str) -> Option<Vec<i32>> {
+        self.portfolio_hierarchy.get(portfolio_id).map(|entry| entry.value.clone())
+    }
+    
+    /// Cache portfolio type (leaf/summary)
+    pub async fn cache_portfolio_type(&self, portfolio_id: &str, portfolio_type: String) {
+        self.portfolio_types.insert(
+            portfolio_id.to_string(), 
+            CacheEntry::new(portfolio_type)
+        );
+    }
+    
+    /// Get portfolio type from cache
+    pub async fn get_portfolio_type(&self, portfolio_id: &str) -> Option<String> {
+        self.portfolio_types.get(portfolio_id).map(|entry| entry.value.clone())
+    }
+    
+    /// Cache holdings for a portfolio on a specific date
+    pub async fn cache_portfolio_holdings(&self, portfolio_id: &str, date: NaiveDate, holdings: Vec<(String, f64)>) {
+        let key = format!("{}:{}", portfolio_id, date);
+        self.portfolio_holdings.insert(key, CacheEntry::new(holdings));
+    }
+    
+    /// Get portfolio holdings from cache
+    pub async fn get_portfolio_holdings(&self, portfolio_id: &str, date: NaiveDate) -> Option<Vec<(String, f64)>> {
+        let key = format!("{}:{}", portfolio_id, date);
+        self.portfolio_holdings.get(&key).map(|entry| entry.value.clone())
+    }
+    
+    /// Cache symbol price for a specific date
+    pub async fn cache_symbol_price(&self, symbol: &str, date: NaiveDate, price: f64) {
+        let key = format!("{}:{}", symbol, date);
+        self.symbol_prices.insert(key, CacheEntry::new(price));
+    }
+    
+    /// Get symbol price from cache
+    pub async fn get_symbol_price(&self, symbol: &str, date: NaiveDate) -> Option<f64> {
+        let key = format!("{}:{}", symbol, date);
+        self.symbol_prices.get(&key).map(|entry| entry.value)
+    }
+    
+    // ---------------------------
+    // Intermediate Cache: Pre-calculated Values
+    // ---------------------------
+    
+    /// Cache symbol value (price * quantity) for portfolio
+    pub async fn cache_symbol_value(&self, portfolio_id: &str, symbol: &str, date: NaiveDate, value: f64) {
+        let key = format!("{}:{}:{}", portfolio_id, symbol, date);
+        self.symbol_values.insert(key, CacheEntry::new(value));
+    }
+    
+    /// Get symbol value from cache
+    pub async fn get_symbol_value(&self, portfolio_id: &str, symbol: &str, date: NaiveDate) -> Option<f64> {
+        let key = format!("{}:{}:{}", portfolio_id, symbol, date);
+        self.symbol_values.get(&key).map(|entry| entry.value)
+    }
+    
+    /// Cache child portfolio value
+    pub async fn cache_child_value(&self, child_id: &str, date: NaiveDate, value: f64) {
+        let key = format!("{}:{}", child_id, date);
+        self.child_values.insert(key, CacheEntry::new(value));
+    }
+    
+    /// Get child portfolio value from cache
+    pub async fn get_child_value(&self, child_id: &str, date: NaiveDate) -> Option<f64> {
+        let key = format!("{}:{}", child_id, date);
+        self.child_values.get(&key).map(|entry| entry.value)
+    }
+    
+    // ---------------------------
+    // Batch Cache Operations
+    // ---------------------------
+    
+    /// Cache date range price series
+    pub async fn cache_date_range_series(&self, portfolio_id: &str, start_date: NaiveDate, end_date: NaiveDate, series: Vec<(NaiveDate, f64)>) {
+        let key = format!("{}:{}:{}", portfolio_id, start_date, end_date);
+        self.date_range_cache.insert(key, series).await;
+    }
+    
+    /// Get date range price series from cache
+    pub async fn get_date_range_series(&self, portfolio_id: &str, start_date: NaiveDate, end_date: NaiveDate) -> Option<Vec<(NaiveDate, f64)>> {
+        let key = format!("{}:{}:{}", portfolio_id, start_date, end_date);
+        self.date_range_cache.get(&key).await
+    }
+    
+    /// Cache bulk calculations (returns, volatilities, etc.)
+    pub async fn cache_bulk_calculation(&self, key: &str, values: Vec<f64>) {
+        self.bulk_calculations.insert(key.to_string(), values).await;
+    }
+    
+    /// Get bulk calculations from cache
+    pub async fn get_bulk_calculation(&self, key: &str) -> Option<Vec<f64>> {
+        self.bulk_calculations.get(key).await
+    }
+
+    // ---------------------------
+    // Cache Warming Strategy
+    // ---------------------------
+    
+    /// Intelligent cache warming for hot portfolios and date ranges
+    pub async fn warm_cache_intelligently(&self, db: &crate::database::Database) -> Result<()> {
+        info!("🔥 Starting intelligent cache warming for performance optimization...");
+        
+        let warming_start = std::time::Instant::now();
+        
+        // 1. Warm portfolio hierarchy (rarely changes)
+        self.warm_portfolio_hierarchy(db).await?;
+        
+        // 2. Warm recent date ranges (last 30 days)
+        self.warm_recent_date_ranges(db).await?;
+        
+        // 3. Warm top portfolios (based on previous access patterns)
+        self.warm_hot_portfolios(db).await?;
+        
+        let warming_duration = warming_start.elapsed();
+        info!("✅ Cache warming completed in {}ms", warming_duration.as_millis());
+        
+        Ok(())
+    }
+    
+    /// Warm portfolio hierarchy cache
+    async fn warm_portfolio_hierarchy(&self, db: &crate::database::Database) -> Result<()> {
+        // Get all portfolio types and hierarchy in one query
+        let portfolio_info = sqlx::query_as::<_, (i32, String, Option<i32>)>(
+            "SELECT portfolio_id, portfolio_type, parent_portfolio_id FROM portfolios"
+        )
+        .fetch_all(&db.pool)
+        .await?;
+        
+        // Cache portfolio types
+        for (id, ptype, parent) in &portfolio_info {
+            self.cache_portfolio_type(&id.to_string(), ptype.clone()).await;
+        }
+        
+        // Cache hierarchy relationships
+        let mut children_map: std::collections::HashMap<i32, Vec<i32>> = 
+            std::collections::HashMap::new();
+            
+        for (id, _, parent) in &portfolio_info {
+            if let Some(parent_id) = parent {
+                children_map.entry(*parent_id).or_insert_with(Vec::new).push(*id);
+            }
+        }
+        
+        for (parent_id, children) in children_map {
+            self.cache_portfolio_hierarchy(&parent_id.to_string(), children).await;
+        }
+        
+        info!("📊 Warmed portfolio hierarchy for {} portfolios", portfolio_info.len());
+        Ok(())
+    }
+    
+    /// Warm recent date ranges (last 30 days)
+    async fn warm_recent_date_ranges(&self, db: &crate::database::Database) -> Result<()> {
+        // Get available date range
+        let date_range = sqlx::query_as::<_, (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>)>(
+            "SELECT MIN(date), MAX(date) FROM holdings"
+        )
+        .fetch_one(&db.pool)
+        .await?;
+        
+        if let (Some(min_date), Some(max_date)) = date_range {
+            // Focus on last 30 days or available range
+            let warm_start = std::cmp::max(min_date, max_date - chrono::Duration::days(30));
+            
+            // Get top 10 most active portfolios
+            let hot_portfolios = sqlx::query_as::<_, (i32,)>(
+                r#"
+                SELECT portfolio_id 
+                FROM portfolios p
+                WHERE portfolio_type = 'leaf'
+                ORDER BY portfolio_id  -- Simple ordering, in production use access patterns
+                LIMIT 10
+                "#
+            )
+            .fetch_all(&db.pool)
+            .await?;
+            
+            // Warm price series for hot portfolios
+            for (portfolio_id,) in hot_portfolios {
+                let series_key = format!("{}:{}:{}", portfolio_id, warm_start, max_date);
+                
+                // Check if not already cached
+                if self.date_range_cache.get(&series_key).await.is_none() {
+                    if let Ok(series) = db.get_portfolio_price_series(&portfolio_id.to_string(), warm_start, max_date).await {
+                        self.cache_date_range_series(&portfolio_id.to_string(), warm_start, max_date, series).await;
+                    }
+                }
+            }
+            
+            info!("🔥 Warmed date ranges from {} to {}", warm_start, max_date);
+        }
+        
+        Ok(())
+    }
+    
+    /// Warm hot portfolios based on access patterns
+    async fn warm_hot_portfolios(&self, _db: &crate::database::Database) -> Result<()> {
+        // In a real system, this would use access logs or metrics
+        // For now, we'll pre-mark some portfolios as hot based on simple heuristics
+        
+        let hot_portfolio_ids = vec!["1", "2", "3", "4", "5"]; // Top 5 portfolios
+        
+        for portfolio_id in hot_portfolio_ids {
+            self.hot_portfolios.insert(
+                portfolio_id.to_string(),
+                std::time::Instant::now(),
+            );
+        }
+        
+        info!("🔥 Marked hot portfolios for priority caching");
+        Ok(())
     }
 
     /// Memory pressure management for massive datasets

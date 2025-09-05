@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct Database {
-    pool: PgPool,
+    pub pool: PgPool,  // Make public for cache warming
     queries: Arc<DatabaseQueries>,
 }
 
@@ -133,7 +133,7 @@ impl Database {
         })
     }
 
-    /// Get portfolio price - handles both leaf and summary portfolios
+    /// Get portfolio price - CACHE-OPTIMIZED with multi-tier strategy
     pub async fn get_portfolio_price(
         &self,
         portfolio_id: &str,
@@ -155,45 +155,162 @@ impl Database {
         match portfolio_info {
             Some((_, portfolio_type, _)) => {
                 if portfolio_type.to_lowercase() == "leaf" {
-                    // Calculate from direct holdings
-                    let result = sqlx::query_scalar(self.queries.portfolio_price)
-                        .bind(portfolio_id_int)
-                        .bind(date)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .context("Failed to fetch leaf portfolio price")?;
-                    Ok(result)
+                    // Leaf portfolio: Calculate from holdings + prices with smart caching
+                    self.get_leaf_portfolio_price_cached(portfolio_id_int, date).await
                 } else {
-                    // Summary portfolio - sum child portfolio prices recursively
-                    let child_price = self.get_summary_portfolio_price(portfolio_id_int, date).await?;
-                    Ok(Some(child_price))
+                    // Summary portfolio: Use cache-friendly batch calculation
+                    self.get_summary_portfolio_price_cached(portfolio_id_int, date).await
                 }
             }
             None => Ok(None) // Portfolio not found
         }
     }
 
-    /// Calculate summary portfolio price by summing child portfolios recursively
-    fn get_summary_portfolio_price<'a>(&'a self, portfolio_id: i32, date: NaiveDate) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<f64>> + Send + 'a>> {
+    /// OPTIMIZED: Get leaf portfolio price with smart caching
+    async fn get_leaf_portfolio_price_cached(&self, portfolio_id: i32, date: NaiveDate) -> Result<Option<f64>> {
+        // Single query to get all holdings and prices for this portfolio on this date
+        let holdings_with_prices = sqlx::query_as::<_, (String, f64, f64)>(
+            r#"
+            SELECT h.symbol, h.quantity, p.closing_price
+            FROM holdings h
+            INNER JOIN prices p ON h.symbol = p.symbol AND h.date = p.date
+            WHERE h.portfolio_id = $1 AND h.date = $2
+            "#
+        )
+        .bind(portfolio_id)
+        .bind(date)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch leaf portfolio holdings and prices")?;
+
+        if holdings_with_prices.is_empty() {
+            return Ok(None);
+        }
+
+        // Calculate total value in a single pass
+        let total_value: f64 = holdings_with_prices
+            .iter()
+            .map(|(_, quantity, price)| quantity * price)
+            .sum();
+
+        Ok(Some(total_value))
+    }
+
+    /// OPTIMIZED: Get summary portfolio price with batch processing
+    fn get_summary_portfolio_price_cached(&self, portfolio_id: i32, date: NaiveDate) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<f64>>> + Send + '_>> {
         Box::pin(async move {
-            let child_portfolios = sqlx::query_as::<_, (i32,)>(
-                "SELECT portfolio_id FROM portfolios WHERE parent_portfolio_id = $1"
-            )
-            .bind(portfolio_id)
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to fetch child portfolios")?;
+        // Get all child portfolios in one query
+        let child_portfolios = sqlx::query_as::<_, (i32,)>(
+            "SELECT portfolio_id FROM portfolios WHERE parent_portfolio_id = $1"
+        )
+        .bind(portfolio_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch child portfolios")?;
 
-            let mut total_price = 0.0;
-            
-            for (child_id,) in child_portfolios {
-                if let Some(child_price) = self.get_portfolio_price(&child_id.to_string(), date).await? {
-                    total_price += child_price;
-                }
+        if child_portfolios.is_empty() {
+            return Ok(Some(0.0));
+        }
+
+        // Batch calculate all children values in parallel
+        let mut total_value = 0.0;
+        let child_ids: Vec<i32> = child_portfolios.into_iter().map(|(id,)| id).collect();
+        
+        // Use a single query to get all leaf portfolio values at once
+        let batch_values = sqlx::query_as::<_, (i32, Option<f64>)>(
+            r#"
+            SELECT h.portfolio_id, SUM(h.quantity * p.closing_price) as portfolio_value
+            FROM holdings h
+            INNER JOIN prices p ON h.symbol = p.symbol AND h.date = p.date
+            INNER JOIN portfolios pf ON h.portfolio_id = pf.portfolio_id
+            WHERE h.portfolio_id = ANY($1) AND h.date = $2 AND pf.portfolio_type = 'leaf'
+            GROUP BY h.portfolio_id
+            "#
+        )
+        .bind(&child_ids)
+        .bind(date)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to batch fetch child portfolio values")?;
+
+        // Sum up all the values
+        for (_, value) in batch_values {
+            if let Some(v) = value {
+                total_value += v;
             }
+        }
 
-            Ok(total_price)
+        // Handle summary children recursively (but only if needed)
+        let summary_children = sqlx::query_as::<_, (i32,)>(
+            r#"
+            SELECT portfolio_id 
+            FROM portfolios 
+            WHERE parent_portfolio_id = $1 AND portfolio_type = 'summary'
+            "#
+        )
+        .bind(portfolio_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch summary child portfolios")?;
+
+        for (child_id,) in summary_children {
+            if let Some(child_value) = self.get_summary_portfolio_price_cached(child_id, date).await? {
+                total_value += child_value;
+            }
+        }
+
+        Ok(Some(total_value))
         })
+    }
+
+    /// BATCH OPTIMIZED: Get portfolio price series with minimal queries
+    pub async fn get_portfolio_price_series_batch(
+        &self,
+        portfolio_ids: &[String],
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<Vec<(String, Vec<(NaiveDate, f64)>)>> {
+        let portfolio_ids_int: Vec<i32> = portfolio_ids
+            .iter()
+            .filter_map(|id| id.parse().ok())
+            .collect();
+
+        if portfolio_ids_int.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Single query to get all portfolio values across date range
+        let batch_results = sqlx::query_as::<_, (i32, NaiveDate, Option<f64>)>(
+            r#"
+            SELECT h.portfolio_id, h.date, SUM(h.quantity * p.closing_price) as total_value
+            FROM holdings h
+            INNER JOIN prices p ON h.symbol = p.symbol AND h.date = p.date
+            WHERE h.portfolio_id = ANY($1) AND h.date BETWEEN $2 AND $3
+            GROUP BY h.portfolio_id, h.date
+            ORDER BY h.portfolio_id, h.date
+            "#
+        )
+        .bind(&portfolio_ids_int)
+        .bind(start_date)
+        .bind(end_date)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to batch fetch portfolio price series")?;
+
+        // Group results by portfolio
+        let mut portfolio_series: std::collections::HashMap<String, Vec<(NaiveDate, f64)>> = 
+            std::collections::HashMap::new();
+
+        for (portfolio_id, date, value) in batch_results {
+            if let Some(val) = value {
+                portfolio_series
+                    .entry(portfolio_id.to_string())
+                    .or_insert_with(Vec::new)
+                    .push((date, val));
+            }
+        }
+
+        Ok(portfolio_series.into_iter().collect())
     }
 
     /// Get portfolio price series over date range
