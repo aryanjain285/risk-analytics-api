@@ -45,30 +45,40 @@ impl DatabaseQueries {
 
             // Calculate daily return using portfolio values
             daily_return_optimized: r#"
-                WITH portfolio_values AS (
-                    SELECT h.date, SUM(h.quantity * p.closing_price) as total_value
-                    FROM holdings h
-                    JOIN prices p ON h.symbol = p.symbol AND h.date = p.date
-                    WHERE h.portfolio_id = $1 AND h.date <= $2
-                    GROUP BY h.date
-                    ORDER BY h.date DESC
-                    LIMIT 2
-                ),
-                value_with_lag AS (
-                    SELECT 
-                        date,
-                        total_value,
-                        LAG(total_value) OVER (ORDER BY date) as prev_value
-                    FROM portfolio_values
-                )
+            portfolio_values AS (
                 SELECT 
-                    CASE 
-                        WHEN prev_value IS NOT NULL AND prev_value != 0 
-                        THEN (total_value - prev_value) / prev_value 
-                        ELSE NULL 
-                    END as daily_return
-                FROM value_with_lag 
+                    h.date,
+                    SUM(h.quantity * p.closing_price) as total_value
+                FROM holdings h
+                JOIN prices p ON h.symbol = p.symbol AND h.date = p.date
+                WHERE h.portfolio_id = $1 
+                  AND h.date IN (SELECT date FROM available_dates)
+                GROUP BY h.date
+            ),
+            current_value AS (
+                SELECT total_value as current_price
+                FROM portfolio_values
                 WHERE date = $2
+            ),
+            previous_value AS (
+                SELECT total_value as previous_price
+                FROM portfolio_values pv
+                JOIN available_dates ad ON pv.date = ad.date
+                WHERE pv.date < $2
+                ORDER BY pv.date DESC
+                LIMIT 1  -- Get the most recent previous date
+            )
+            SELECT 
+                $2 as calculation_date,
+                cv.current_price,
+                pv.previous_price,
+                CASE 
+                    WHEN pv.previous_price IS NOT NULL AND pv.previous_price != 0 
+                    THEN (cv.current_price - pv.previous_price) / pv.previous_price 
+                    ELSE NULL 
+                END as daily_return
+            FROM current_value cv
+            CROSS JOIN previous_value pv
             "#,
 
             // Get aligned portfolio data for correlation/tracking error
