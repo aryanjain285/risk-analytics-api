@@ -1,5 +1,5 @@
 use sqlx::postgres::{PgConnectOptions, PgConnection};
-use sqlx::Connection;
+use sqlx::{Connection, Row};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -194,6 +194,167 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("❌ prices table not found");
     }
     
-    println!("\n✅ Schema check complete!");
+    // Check if benchmark table exists and analyze it thoroughly
+    if tables.iter().any(|(name,)| name == "benchmark") {
+        println!("\n📊 COMPREHENSIVE BENCHMARK TABLE ANALYSIS");
+        println!("========================================");
+        
+        let benchmark_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM benchmark")
+            .fetch_one(&mut conn)
+            .await?;
+        println!("  - Total benchmark records: {}", benchmark_count.0);
+        
+        // Check benchmark table columns
+        println!("\n📝 Benchmark table columns:");
+        let benchmark_columns: Vec<(String, String)> = sqlx::query_as(
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'benchmark' ORDER BY ordinal_position"
+        )
+        .fetch_all(&mut conn)
+        .await?;
+        
+        for (col_name, col_type) in benchmark_columns {
+            println!("  - {}: {}", col_name, col_type);
+        }
+        
+        if benchmark_count.0 > 0 {
+            println!("\n📝 Sample benchmark data (first 10 rows):");
+            let sample_benchmarks: Vec<(i32, chrono::NaiveDate, i32)> = sqlx::query_as(
+                "SELECT bmk_id, date, bmk_returns FROM benchmark ORDER BY bmk_id, date LIMIT 10"
+            )
+            .fetch_all(&mut conn)
+            .await?;
+            
+            for (bmk_id, date, returns) in sample_benchmarks {
+                println!("  - Benchmark ID: {}, Date: {}, Returns: {}", bmk_id, date, returns);
+            }
+            
+            // Get date range for benchmarks
+            println!("\n📅 Benchmark date range:");
+            let benchmark_date_range: (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>) = sqlx::query_as(
+                "SELECT MIN(date), MAX(date) FROM benchmark"
+            )
+            .fetch_one(&mut conn)
+            .await?;
+            
+            if let (Some(min_date), Some(max_date)) = benchmark_date_range {
+                println!("  - Date range: {} to {}", min_date, max_date);
+                println!("  - Total days: {}", (max_date - min_date).num_days() + 1);
+            }
+            
+            // Get unique benchmark IDs
+            println!("\n🔢 Unique benchmark IDs:");
+            let unique_benchmarks: Vec<(i32,)> = sqlx::query_as(
+                "SELECT DISTINCT bmk_id FROM benchmark ORDER BY bmk_id"
+            )
+            .fetch_all(&mut conn)
+            .await?;
+            
+            for (bmk_id,) in unique_benchmarks {
+                println!("  - Benchmark ID: {}", bmk_id);
+            }
+        }
+    } else {
+        println!("\n❌ benchmark table not found");
+    }
+    
+    // Comprehensive analysis of ALL tables
+    println!("\n🔍 COMPREHENSIVE DATABASE ANALYSIS");
+    println!("========================================");
+    
+    for (table_name,) in &tables {
+        println!("\n📊 TABLE: {}", table_name);
+        println!("----------------------------------------");
+        
+        // Get row count
+        let row_count: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {}", table_name))
+            .fetch_one(&mut conn)
+            .await?;
+        println!("  📈 Total rows: {}", row_count.0);
+        
+        // Get columns
+        let table_columns: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position"
+        )
+        .bind(table_name)
+        .fetch_all(&mut conn)
+        .await?;
+        
+        println!("  📋 Columns:");
+        for (col_name, col_type, is_nullable) in table_columns {
+            println!("    - {}: {} (nullable: {})", col_name, col_type, is_nullable);
+        }
+        
+        if row_count.0 > 0 {
+            // Show first few rows of each table for understanding data structure
+            println!("  📝 Sample data (first 3 rows):");
+            let sample_query = format!("SELECT * FROM {} LIMIT 3", table_name);
+            let rows = sqlx::query(&sample_query)
+                .fetch_all(&mut conn)
+                .await?;
+            
+            for (i, row) in rows.iter().enumerate() {
+                println!("    Row {}: {} columns", i + 1, row.len());
+                // Note: We can't easily print all column values without knowing types
+                // This gives us structure information
+            }
+        }
+    }
+    
+    // Cross-table analysis for understanding relationships
+    println!("\n🔗 CROSS-TABLE RELATIONSHIP ANALYSIS");
+    println!("========================================");
+    
+    // Check which portfolios have holdings
+    println!("\n📊 Portfolios with holdings data:");
+    let portfolios_with_holdings: Vec<(i32, i64)> = sqlx::query_as(
+        "SELECT h.portfolio_id, COUNT(*) as holding_count FROM holdings h GROUP BY h.portfolio_id ORDER BY holding_count DESC LIMIT 10"
+    )
+    .fetch_all(&mut conn)
+    .await?;
+    
+    for (portfolio_id, count) in portfolios_with_holdings {
+        println!("  - Portfolio {}: {} holdings", portfolio_id, count);
+    }
+    
+    // Check date overlap between holdings and prices
+    println!("\n📅 Date overlap analysis:");
+    let holdings_dates: (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>) = sqlx::query_as(
+        "SELECT MIN(date), MAX(date) FROM holdings"
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    
+    let prices_dates: (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>) = sqlx::query_as(
+        "SELECT MIN(date), MAX(date) FROM prices"
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    
+    println!("  📊 Holdings date range: {:?} to {:?}", holdings_dates.0, holdings_dates.1);
+    println!("  💰 Prices date range: {:?} to {:?}", prices_dates.0, prices_dates.1);
+    
+    // Check symbol overlap between holdings and prices
+    println!("\n🔤 Symbol analysis:");
+    let holdings_symbols: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT symbol) FROM holdings")
+        .fetch_one(&mut conn)
+        .await?;
+    let prices_symbols: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT symbol) FROM prices")
+        .fetch_one(&mut conn)
+        .await?;
+    
+    println!("  📊 Distinct symbols in holdings: {}", holdings_symbols.0);
+    println!("  💰 Distinct symbols in prices: {}", prices_symbols.0);
+    
+    // Check common symbols
+    let common_symbols: (i64,) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT h.symbol) FROM holdings h INNER JOIN prices p ON h.symbol = p.symbol"
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    
+    println!("  🔗 Common symbols (holdings ∩ prices): {}", common_symbols.0);
+    
+    println!("\n✅ COMPREHENSIVE SCHEMA ANALYSIS COMPLETE!");
+    println!("========================================");
     Ok(())
 }

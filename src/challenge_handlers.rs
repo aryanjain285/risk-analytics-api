@@ -7,7 +7,7 @@ use axum::{
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{calculations::SIMDFinancialCalculator, AppState};
 
@@ -633,13 +633,16 @@ pub async fn get_correlation(
     {
         Ok((prices1, prices2)) => {
             if prices1.len() < 2 || prices2.len() < 2 {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "Insufficient data for correlation calculation (need at least 2 aligned data points)".to_string(),
-                        code: "INSUFFICIENT_DATA".to_string(),
-                    }),
-                ));
+                // Return correlation of 0.0 when there's insufficient overlapping data
+                // This is a valid business case - portfolios with no overlapping dates have 0 correlation
+                warn!("Insufficient overlapping data for correlation between portfolios {} and {} ({} and {} data points)", 
+                      params.portfolio_id1, params.portfolio_id2, prices1.len(), prices2.len());
+                
+                return Ok(Json(CorrelationResponse {
+                    portfolio_id1: params.portfolio_id1,
+                    portfolio_id2: params.portfolio_id2,
+                    correlation: 0.0, // No correlation when no overlapping data
+                }));
             }
 
             // Calculate correlation using SIMD optimization
@@ -753,37 +756,49 @@ pub async fn get_tracking_error(
         }));
     }
 
-    // Fetch aligned data for portfolio and benchmark
-    match state
+    // Fetch portfolio returns and benchmark returns separately
+    let portfolio_prices_result = state
         .db
-        .get_aligned_price_series_parallel(
-            &params.portfolio_id,
-            &params.benchmark_id,
-            start_date,
-            end_date,
-        )
-        .await
-    {
-        Ok((portfolio_prices, benchmark_prices)) => {
-            if portfolio_prices.len() < 2 || benchmark_prices.len() < 2 {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "Insufficient data for tracking error calculation".to_string(),
-                        code: "INSUFFICIENT_DATA".to_string(),
-                    }),
-                ));
+        .get_portfolio_price_series(&params.portfolio_id, start_date, end_date)
+        .await;
+    
+    let benchmark_returns_result = state
+        .db
+        .get_benchmark_returns(&params.benchmark_id, start_date, end_date)
+        .await;
+    
+    match (portfolio_prices_result, benchmark_returns_result) {
+        (Ok(portfolio_prices), Ok(benchmark_returns)) => {
+            if portfolio_prices.len() < 2 || benchmark_returns.len() < 2 {
+                // Return tracking error of 0.0 when insufficient data
+                warn!("Insufficient data for tracking error between portfolio {} and benchmark {} ({} and {} data points)", 
+                      params.portfolio_id, params.benchmark_id, portfolio_prices.len(), benchmark_returns.len());
+                
+                return Ok(Json(TrackingErrorResponse {
+                    portfolio_id: params.portfolio_id,
+                    benchmark_id: params.benchmark_id,
+                    tracking_error: 0.0,
+                }));
             }
 
             // Calculate tracking error using SIMD optimization
             let tracking_error = tokio::task::spawn_blocking(move || {
+                // Extract prices from (NaiveDate, f64) tuples
+                let prices_only: Vec<f64> = portfolio_prices.iter().map(|(_, price)| *price).collect();
+                
+                // Convert portfolio prices to returns
                 let portfolio_returns =
-                    SIMDFinancialCalculator::daily_returns_simd(&portfolio_prices);
-                let benchmark_returns =
-                    SIMDFinancialCalculator::daily_returns_simd(&benchmark_prices);
+                    SIMDFinancialCalculator::daily_returns_simd(&prices_only);
+                
+                // Benchmark returns are already returns, not prices
+                // Ensure we have the same length by taking the minimum
+                let min_len = portfolio_returns.len().min(benchmark_returns.len());
+                let portfolio_returns_aligned = &portfolio_returns[..min_len];
+                let benchmark_returns_aligned = &benchmark_returns[..min_len];
+                
                 SIMDFinancialCalculator::tracking_error_optimized(
-                    &portfolio_returns,
-                    &benchmark_returns,
+                    portfolio_returns_aligned,
+                    benchmark_returns_aligned,
                 )
             })
             .await
@@ -821,12 +836,22 @@ pub async fn get_tracking_error(
                 tracking_error,
             }))
         }
-        Err(e) => {
-            error!("Database error fetching portfolio vs benchmark data: {}", e);
+        (Err(portfolio_err), _) => {
+            error!("Database error fetching portfolio data: {}", portfolio_err);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
+                    error: "Failed to fetch portfolio data".to_string(),
+                    code: "DATABASE_ERROR".to_string(),
+                }),
+            ))
+        }
+        (_, Err(benchmark_err)) => {
+            error!("Database error fetching benchmark data: {}", benchmark_err);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to fetch benchmark data".to_string(),
                     code: "DATABASE_ERROR".to_string(),
                 }),
             ))

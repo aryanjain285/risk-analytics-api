@@ -582,7 +582,7 @@ impl Database {
 
         let query = r#"
             SELECT date, bmk_returns
-            FROM benchmarks
+            FROM benchmark
             WHERE bmk_id = $1 AND date BETWEEN $2 AND $3
             ORDER BY date
         "#;
@@ -601,7 +601,9 @@ impl Database {
             .context("Failed to fetch benchmark data")?
         {
             let date: NaiveDate = row.get("date");
-            let return_value: f64 = row.get("bmk_returns");
+            let return_value_raw: i32 = row.get("bmk_returns");
+            // Convert integer to float (seems to be stored as scaled values)
+            let return_value: f64 = return_value_raw as f64 / 10000000.0; // Convert to decimal percentage
             benchmark_series.push((date, return_value));
         }
 
