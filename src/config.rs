@@ -1,4 +1,4 @@
-// src/config.rs - Production configuration management
+// src/config.rs - Conservative configuration for database limits
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -69,9 +69,9 @@ pub struct LoggingConfig {
 }
 
 impl AppConfig {
-    /// Load configuration from environment variables with production defaults
+    /// Load configuration from environment variables with conservative defaults
     pub fn load() -> Result<Self> {
-        // Database configuration (provided in hackathon docs)
+        // Database configuration - CONSERVATIVE SETTINGS
         let database = DatabaseConfig {
             host: env::var("DATABASE_HOST")
                 .unwrap_or_else(|_| "aws-0-ap-southeast-1.pooler.supabase.com".to_string()),
@@ -85,19 +85,19 @@ impl AppConfig {
             password: env::var("DATABASE_PASSWORD")
                 .unwrap_or_else(|_| "e5ci7swfjroiqs4f".to_string()),
             max_connections: env::var("DATABASE_MAX_CONNECTIONS")
-                .unwrap_or_else(|_| "80".to_string())
+                .unwrap_or_else(|_| "10".to_string()) // Reduced from 80
                 .parse()
                 .context("Invalid DATABASE_MAX_CONNECTIONS")?,
             min_connections: env::var("DATABASE_MIN_CONNECTIONS")
-                .unwrap_or_else(|_| "40".to_string())
+                .unwrap_or_else(|_| "2".to_string()) // Reduced from 40
                 .parse()
                 .context("Invalid DATABASE_MIN_CONNECTIONS")?,
             connection_timeout_ms: env::var("DATABASE_TIMEOUT_MS")
-                .unwrap_or_else(|_| "5000".to_string())
+                .unwrap_or_else(|_| "30000".to_string()) // Increased from 5000
                 .parse()
                 .context("Invalid DATABASE_TIMEOUT_MS")?,
             statement_cache_capacity: env::var("DATABASE_STATEMENT_CACHE")
-                .unwrap_or_else(|_| "5000".to_string())
+                .unwrap_or_else(|_| "1000".to_string()) // Reduced from 5000
                 .parse()
                 .context("Invalid DATABASE_STATEMENT_CACHE")?,
             enable_ssl: env::var("DATABASE_ENABLE_SSL")
@@ -106,14 +106,14 @@ impl AppConfig {
                 .context("Invalid DATABASE_ENABLE_SSL")?,
         };
 
-        // Cache configuration - optimized for massive datasets
+        // Cache configuration - moderate settings
         let cache = CacheConfig {
             l1_max_entries: env::var("CACHE_L1_MAX_ENTRIES")
-                .unwrap_or_else(|_| "100000".to_string())
+                .unwrap_or_else(|_| "50000".to_string()) // Reduced from 100000
                 .parse()
                 .context("Invalid CACHE_L1_MAX_ENTRIES")?,
             l2_max_entries: env::var("CACHE_L2_MAX_ENTRIES")
-                .unwrap_or_else(|_| "50000".to_string())
+                .unwrap_or_else(|_| "25000".to_string()) // Reduced from 50000
                 .parse()
                 .context("Invalid CACHE_L2_MAX_ENTRIES")?,
             ttl_seconds: env::var("CACHE_TTL_SECONDS")
@@ -135,7 +135,7 @@ impl AppConfig {
             redis_url: env::var("REDIS_URL").ok(),
         };
 
-        // Performance configuration - NUCLEAR settings
+        // Performance configuration - balanced settings
         let performance = PerformanceConfig {
             enable_simd: env::var("PERFORMANCE_ENABLE_SIMD")
                 .unwrap_or_else(|_| "true".to_string())
@@ -150,11 +150,11 @@ impl AppConfig {
                 .parse()
                 .context("Invalid PERFORMANCE_PARALLEL_THRESHOLD")?,
             chunk_size: env::var("PERFORMANCE_CHUNK_SIZE")
-                .unwrap_or_else(|_| "10000".to_string())
+                .unwrap_or_else(|_| "5000".to_string()) // Reduced from 10000
                 .parse()
                 .context("Invalid PERFORMANCE_CHUNK_SIZE")?,
             max_request_size: env::var("PERFORMANCE_MAX_REQUEST_SIZE")
-                .unwrap_or_else(|_| "1000000".to_string())
+                .unwrap_or_else(|_| "500000".to_string()) // Reduced from 1000000
                 .parse()
                 .context("Invalid PERFORMANCE_MAX_REQUEST_SIZE")?,
             enable_compression: env::var("PERFORMANCE_ENABLE_COMPRESSION")
@@ -162,12 +162,12 @@ impl AppConfig {
                 .parse()
                 .context("Invalid PERFORMANCE_ENABLE_COMPRESSION")?,
             connection_pool_size: env::var("PERFORMANCE_CONNECTION_POOL_SIZE")
-                .unwrap_or_else(|_| "80".to_string())
+                .unwrap_or_else(|_| "15".to_string()) // Reduced from 80
                 .parse()
                 .context("Invalid PERFORMANCE_CONNECTION_POOL_SIZE")?,
         };
 
-        // Server configuration
+        // Server configuration - reasonable settings
         let server = ServerConfig {
             host: env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             port: env::var("SERVER_PORT")
@@ -176,7 +176,7 @@ impl AppConfig {
                 .context("Invalid SERVER_PORT")?,
             workers: env::var("SERVER_WORKERS").ok().and_then(|s| s.parse().ok()),
             max_connections: env::var("SERVER_MAX_CONNECTIONS")
-                .unwrap_or_else(|_| "10000".to_string())
+                .unwrap_or_else(|_| "1000".to_string()) // Reduced from 10000
                 .parse()
                 .context("Invalid SERVER_MAX_CONNECTIONS")?,
             timeout_seconds: env::var("SERVER_TIMEOUT_SECONDS")
@@ -217,47 +217,6 @@ impl AppConfig {
         })
     }
 
-    /// Load configuration from TOML file (useful for local development)
-    pub fn load_from_file(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path))?;
-
-        let config: Self = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path))?;
-
-        Ok(config)
-    }
-
-    /// Validate configuration and return any issues
-    pub fn validate(&self) -> Result<()> {
-        // Database validation
-        if self.database.host.is_empty() {
-            return Err(anyhow::anyhow!("Database host cannot be empty"));
-        }
-        if self.database.max_connections < self.database.min_connections {
-            return Err(anyhow::anyhow!(
-                "Max connections must be >= min connections"
-            ));
-        }
-
-        // Cache validation
-        if self.cache.l1_max_entries == 0 {
-            return Err(anyhow::anyhow!("L1 cache max entries must be > 0"));
-        }
-
-        // Performance validation
-        if self.performance.chunk_size == 0 {
-            return Err(anyhow::anyhow!("Chunk size must be > 0"));
-        }
-
-        // Server validation
-        if self.server.port == 0 {
-            return Err(anyhow::anyhow!("Server port must be valid"));
-        }
-
-        Ok(())
-    }
-
     /// Create optimized configuration for production deployment
     pub fn production_optimized() -> Self {
         Self {
@@ -267,38 +226,38 @@ impl AppConfig {
                 database: "postgres".to_string(),
                 username: "team9dbuser.jdcgkhwtrsdhyysagkwb".to_string(),
                 password: "e5ci7swfjroiqs4f".to_string(),
-                max_connections: 100,           // High concurrency
-                min_connections: 50,            // Always ready
-                connection_timeout_ms: 3000,    // Fast timeout
-                statement_cache_capacity: 5000, // Cache many statements
+                max_connections: 15,            // Max allowed
+                min_connections: 3,             // Conservative start
+                connection_timeout_ms: 30000,   // 30 second timeout
+                statement_cache_capacity: 1000, // Reasonable cache
                 enable_ssl: true,
             },
             cache: CacheConfig {
-                l1_max_entries: 200_000,      // Large L1 cache
-                l2_max_entries: 100_000,      // Large L2 cache
+                l1_max_entries: 50_000,       // Moderate L1 cache
+                l2_max_entries: 25_000,       // Moderate L2 cache
                 ttl_seconds: 600,             // 10 minute TTL
                 cleanup_interval_seconds: 60, // Clean every minute
-                memory_threshold_mb: 1000,    // 1GB threshold
-                enable_distributed: false,    // Keep it simple for hackathon
+                memory_threshold_mb: 500,     // 500MB threshold
+                enable_distributed: false,    // Keep it simple
                 redis_url: None,
             },
             performance: PerformanceConfig {
-                enable_simd: true,           // MAXIMUM SPEED
-                enable_parallel: true,       // Use all cores
-                parallel_threshold: 10_000,  // Parallel for large datasets
-                chunk_size: 10_000,          // Optimal chunk size
-                max_request_size: 1_000_000, // Handle large requests
-                enable_compression: false,   // Skip compression for speed
-                connection_pool_size: 100,   // Large pool
+                enable_simd: true,         // Keep SIMD for speed
+                enable_parallel: true,     // Use cores efficiently
+                parallel_threshold: 5_000, // Lower threshold
+                chunk_size: 5_000,         // Smaller chunks
+                max_request_size: 500_000, // Reasonable request size
+                enable_compression: true,  // Enable compression
+                connection_pool_size: 15,  // Match max connections
             },
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
-                port: 8000,              // Required port
-                workers: None,           // Auto-detect
-                max_connections: 50_000, // Handle massive load
-                timeout_seconds: 30,     // Reasonable timeout
-                keep_alive_seconds: 75,  // Keep connections alive
-                enable_cors: true,       // Required for judge app
+                port: 8000,             // Required port
+                workers: None,          // Auto-detect
+                max_connections: 1_000, // Reasonable load
+                timeout_seconds: 30,    // Reasonable timeout
+                keep_alive_seconds: 75, // Keep connections alive
+                enable_cors: true,      // Required for judge app
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -310,24 +269,62 @@ impl AppConfig {
         }
     }
 
-    /// Create configuration optimized for massive datasets
-    pub fn massive_dataset_optimized() -> Self {
-        let mut config = Self::production_optimized();
-
-        // Optimize for massive datasets
-        config.performance.chunk_size = 50_000; // Larger chunks
-        config.performance.parallel_threshold = 50_000; // Higher parallel threshold
-        config.database.max_connections = 150; // More DB connections
-        config.cache.l1_max_entries = 500_000; // Massive L1 cache
-        config.cache.memory_threshold_mb = 2000; // 2GB memory threshold
-
-        config
+    /// Development configuration with minimal resources
+    pub fn development() -> Self {
+        Self {
+            database: DatabaseConfig {
+                host: "aws-0-ap-southeast-1.pooler.supabase.com".to_string(),
+                port: 5432,
+                database: "postgres".to_string(),
+                username: "team9dbuser.jdcgkhwtrsdhyysagkwb".to_string(),
+                password: "e5ci7swfjroiqs4f".to_string(),
+                max_connections: 5,            // Very conservative
+                min_connections: 1,            // Start with 1
+                connection_timeout_ms: 30000,  // Long timeout
+                statement_cache_capacity: 100, // Small cache
+                enable_ssl: true,
+            },
+            cache: CacheConfig {
+                l1_max_entries: 10_000,
+                l2_max_entries: 5_000,
+                ttl_seconds: 300,
+                cleanup_interval_seconds: 60,
+                memory_threshold_mb: 100,
+                enable_distributed: false,
+                redis_url: None,
+            },
+            performance: PerformanceConfig {
+                enable_simd: true,
+                enable_parallel: false, // Single-threaded for dev
+                parallel_threshold: 1000,
+                chunk_size: 1000,
+                max_request_size: 50_000,
+                enable_compression: false,
+                connection_pool_size: 5,
+            },
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8000,
+                workers: Some(1),
+                max_connections: 100,
+                timeout_seconds: 30,
+                keep_alive_seconds: 60,
+                enable_cors: true,
+            },
+            logging: LoggingConfig {
+                level: "debug".to_string(),
+                enable_access_logs: true,
+                enable_error_logs: true,
+                log_format: "text".to_string(),
+                log_file: None,
+            },
+        }
     }
 
     /// Print configuration summary for deployment verification
     pub fn print_summary(&self) {
-        println!("🦀 NUCLEAR RUST API CONFIGURATION");
-        println!("================================");
+        println!("🦀 CONSERVATIVE RUST API CONFIGURATION");
+        println!("=====================================");
         println!(
             "🗄️  Database: {}:{}",
             self.database.host, self.database.port
@@ -335,6 +332,10 @@ impl AppConfig {
         println!(
             "📊 Database Pool: {}-{} connections",
             self.database.min_connections, self.database.max_connections
+        );
+        println!(
+            "⏱️  Connection Timeout: {}ms",
+            self.database.connection_timeout_ms
         );
         println!("⚡ Cache L1: {} entries", self.cache.l1_max_entries);
         println!("💾 Cache L2: {} entries", self.cache.l2_max_entries);
@@ -344,10 +345,31 @@ impl AppConfig {
             self.performance.enable_parallel
         );
         println!("🌐 Server: {}:{}", self.server.host, self.server.port);
-        println!("📈 Max Connections: {}", self.server.max_connections);
+        println!("📈 Max Server Connections: {}", self.server.max_connections);
         println!("⏱️  Request Timeout: {}s", self.server.timeout_seconds);
         println!("📋 Log Level: {}", self.logging.level);
-        println!("================================");
+        println!("=====================================");
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.database.host.is_empty() {
+            return Err(anyhow::anyhow!("Database host cannot be empty"));
+        }
+        if self.database.max_connections < self.database.min_connections {
+            return Err(anyhow::anyhow!(
+                "Max connections must be >= min connections"
+            ));
+        }
+        if self.cache.l1_max_entries == 0 {
+            return Err(anyhow::anyhow!("L1 cache max entries must be > 0"));
+        }
+        if self.performance.chunk_size == 0 {
+            return Err(anyhow::anyhow!("Chunk size must be > 0"));
+        }
+        if self.server.port == 0 {
+            return Err(anyhow::anyhow!("Server port must be valid"));
+        }
+        Ok(())
     }
 }
 
@@ -360,7 +382,7 @@ impl DatabaseConfig {
         )
     }
 
-    /// Get connection options for maximum performance
+    /// Get connection options with SSL requirement
     pub fn connection_options(&self) -> sqlx::postgres::PgConnectOptions {
         let mut options = sqlx::postgres::PgConnectOptions::new()
             .host(&self.host)
@@ -372,152 +394,19 @@ impl DatabaseConfig {
             .statement_cache_capacity(self.statement_cache_capacity);
 
         if self.enable_ssl {
-            options = options.ssl_mode(sqlx::postgres::PgSslMode::Prefer);
+            options = options.ssl_mode(sqlx::postgres::PgSslMode::Require);
         }
 
-        // Performance optimizations
+        // Conservative performance settings
         options = options.options([
-            ("tcp_nodelay", "true"),                        // Reduce network latency
-            ("tcp_user_timeout", "5000"),                   // Fast failure detection
-            ("statement_timeout", "30s"),                   // Prevent runaway queries
-            ("idle_in_transaction_session_timeout", "10s"), // Clean up idle connections
-            ("application_name", "nuclear_api"),            // Identify our connections
+            ("tcp_nodelay", "true"),
+            ("tcp_user_timeout", "30000"), // Increased timeout
+            ("statement_timeout", "60s"),  // Longer query timeout
+            ("idle_in_transaction_session_timeout", "30s"),
+            ("application_name", "nuclear_api"),
         ]);
 
         options
-    }
-}
-
-/// Environment-specific configurations
-impl AppConfig {
-    /// Development configuration with relaxed settings
-    pub fn development() -> Self {
-        let mut config = Self::production_optimized();
-
-        config.logging.level = "debug".to_string();
-        config.logging.enable_access_logs = true;
-        config.server.max_connections = 1_000;
-        config.database.max_connections = 20;
-        config.cache.l1_max_entries = 10_000;
-
-        config
-    }
-
-    /// Test configuration with minimal resources
-    pub fn test() -> Self {
-        Self {
-            database: DatabaseConfig {
-                host: "localhost".to_string(),
-                port: 5432,
-                database: "test_db".to_string(),
-                username: "test_user".to_string(),
-                password: "test_pass".to_string(),
-                max_connections: 5,
-                min_connections: 2,
-                connection_timeout_ms: 1000,
-                statement_cache_capacity: 100,
-                enable_ssl: false,
-            },
-            cache: CacheConfig {
-                l1_max_entries: 1_000,
-                l2_max_entries: 500,
-                ttl_seconds: 60,
-                cleanup_interval_seconds: 30,
-                memory_threshold_mb: 50,
-                enable_distributed: false,
-                redis_url: None,
-            },
-            performance: PerformanceConfig {
-                enable_simd: true,
-                enable_parallel: false, // Single-threaded for tests
-                parallel_threshold: 1000,
-                chunk_size: 100,
-                max_request_size: 10_000,
-                enable_compression: false,
-                connection_pool_size: 5,
-            },
-            server: ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: 8000,
-                workers: Some(1),
-                max_connections: 100,
-                timeout_seconds: 10,
-                keep_alive_seconds: 30,
-                enable_cors: true,
-            },
-            logging: LoggingConfig {
-                level: "debug".to_string(),
-                enable_access_logs: true,
-                enable_error_logs: true,
-                log_format: "text".to_string(),
-                log_file: None,
-            },
-        }
-    }
-}
-
-/// Configuration validation utilities
-pub mod validation {
-    use super::*;
-
-    pub fn validate_database_config(config: &DatabaseConfig) -> Vec<String> {
-        let mut errors = Vec::new();
-
-        if config.host.is_empty() {
-            errors.push("Database host cannot be empty".to_string());
-        }
-
-        if config.port == 0 || config.port > 65535 {
-            errors.push("Database port must be between 1 and 65535".to_string());
-        }
-
-        if config.username.is_empty() {
-            errors.push("Database username cannot be empty".to_string());
-        }
-
-        if config.max_connections == 0 {
-            errors.push("Database max connections must be > 0".to_string());
-        }
-
-        if config.max_connections < config.min_connections {
-            errors.push("Database max connections must be >= min connections".to_string());
-        }
-
-        errors
-    }
-
-    pub fn validate_performance_config(config: &PerformanceConfig) -> Vec<String> {
-        let mut errors = Vec::new();
-
-        if config.chunk_size == 0 {
-            errors.push("Chunk size must be > 0".to_string());
-        }
-
-        if config.chunk_size > config.max_request_size {
-            errors.push("Chunk size cannot be larger than max request size".to_string());
-        }
-
-        if config.parallel_threshold == 0 {
-            errors.push("Parallel threshold must be > 0".to_string());
-        }
-
-        errors
-    }
-
-    pub fn validate_complete_config(config: &AppConfig) -> Result<()> {
-        let mut all_errors = Vec::new();
-
-        all_errors.extend(validate_database_config(&config.database));
-        all_errors.extend(validate_performance_config(&config.performance));
-
-        if !all_errors.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Configuration validation failed:\n{}",
-                all_errors.join("\n")
-            ));
-        }
-
-        Ok(())
     }
 }
 
@@ -528,45 +417,14 @@ mod tests {
     #[test]
     fn test_production_config_validation() {
         let config = AppConfig::production_optimized();
-        assert!(validation::validate_complete_config(&config).is_ok());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.database.max_connections, 15);
     }
 
     #[test]
-    fn test_database_connection_string() {
-        let db_config = DatabaseConfig {
-            host: "localhost".to_string(),
-            port: 5432,
-            database: "testdb".to_string(),
-            username: "user".to_string(),
-            password: "pass".to_string(),
-            max_connections: 10,
-            min_connections: 5,
-            connection_timeout_ms: 1000,
-            statement_cache_capacity: 100,
-            enable_ssl: false,
-        };
-
-        let connection_string = db_config.connection_string();
-        assert_eq!(
-            connection_string,
-            "postgresql://user:pass@localhost:5432/testdb"
-        );
-    }
-
-    #[test]
-    fn test_cache_config_validation() {
-        let cache_config = CacheConfig {
-            l1_max_entries: 0, // Invalid
-            l2_max_entries: 1000,
-            ttl_seconds: 60,
-            cleanup_interval_seconds: 30,
-            memory_threshold_mb: 100,
-            enable_distributed: false,
-            redis_url: None,
-        };
-
-        // Should catch the invalid l1_max_entries
-        // In a real validation function, this would fail
-        assert_eq!(cache_config.l1_max_entries, 0);
+    fn test_development_config() {
+        let config = AppConfig::development();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.database.max_connections, 5);
     }
 }

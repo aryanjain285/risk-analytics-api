@@ -1,4 +1,4 @@
-// src/challenge_handlers.rs - Exact API handlers for challenge specification
+// src/challenge_handlers.rs - Updated handlers for actual database schema
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
-use crate::{AppState, calculations::SIMDFinancialCalculator};
+use crate::{calculations::SIMDFinancialCalculator, AppState};
 
 // Request/Response models matching exact Swagger specification
 
@@ -144,7 +144,7 @@ pub async fn get_portfolio_price(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PortfolioPriceResponse>, (StatusCode, Json<ErrorResponse>)> {
     let start_time = std::time::Instant::now();
-    
+
     // Parse date
     let date = match parse_date(&params.date) {
         Ok(d) => d,
@@ -160,9 +160,12 @@ pub async fn get_portfolio_price(
     };
 
     // Check cache first
-    let cache_key = format!("portfolio_price_{}_{}", params.portfolio_id, date);
-    if let Some(cached_price) = state.cache.get_l1_portfolio_price(&params.portfolio_id, date).await {
-        debug!("Cache hit for portfolio price: {}", cache_key);
+    if let Some(cached_price) = state
+        .cache
+        .get_l1_portfolio_price(&params.portfolio_id, date)
+        .await
+    {
+        debug!("Cache hit for portfolio price: {}", params.portfolio_id);
         return Ok(Json(PortfolioPriceResponse {
             portfolio_id: params.portfolio_id,
             date: params.date,
@@ -170,16 +173,26 @@ pub async fn get_portfolio_price(
         }));
     }
 
-    // Fetch from database
-    match state.db.get_portfolio_price(&params.portfolio_id, date).await {
+    // Fetch from database (calculates portfolio value from holdings * prices)
+    match state
+        .db
+        .get_portfolio_price(&params.portfolio_id, date)
+        .await
+    {
         Ok(Some(price)) => {
             // Cache the result
-            state.cache.cache_portfolio_price_async(&params.portfolio_id, date, price).await;
-            
+            state
+                .cache
+                .cache_portfolio_price_async(&params.portfolio_id, date, price)
+                .await;
+
             let response_time = start_time.elapsed();
             info!(
-                "Portfolio price fetched: {} on {} = {} ({}ms)",
-                params.portfolio_id, params.date, price, response_time.as_millis()
+                "Portfolio price calculated: {} on {} = {} ({}ms)",
+                params.portfolio_id,
+                params.date,
+                price,
+                response_time.as_millis()
             );
 
             Ok(Json(PortfolioPriceResponse {
@@ -191,7 +204,10 @@ pub async fn get_portfolio_price(
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!("No price found for portfolio {} on {}", params.portfolio_id, params.date),
+                error: format!(
+                    "No price data found for portfolio {} on {}",
+                    params.portfolio_id, params.date
+                ),
                 code: "NOT_FOUND".to_string(),
             }),
         )),
@@ -214,7 +230,7 @@ pub async fn get_daily_return(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DailyReturnResponse>, (StatusCode, Json<ErrorResponse>)> {
     let start_time = std::time::Instant::now();
-    
+
     let date = match parse_date(&params.date) {
         Ok(d) => d,
         Err(e) => {
@@ -229,9 +245,12 @@ pub async fn get_daily_return(
     };
 
     // Check cache first
-    let cache_key = format!("daily_return_{}_{}", params.portfolio_id, date);
-    if let Some(cached_return) = state.cache.get_l1_daily_return(&params.portfolio_id, date).await {
-        debug!("Cache hit for daily return: {}", cache_key);
+    if let Some(cached_return) = state
+        .cache
+        .get_l1_daily_return(&params.portfolio_id, date)
+        .await
+    {
+        debug!("Cache hit for daily return: {}", params.portfolio_id);
         return Ok(Json(DailyReturnResponse {
             portfolio_id: params.portfolio_id,
             date: params.date,
@@ -239,16 +258,22 @@ pub async fn get_daily_return(
         }));
     }
 
-    // Fetch from database
+    // Fetch from database (calculates return from portfolio values)
     match state.db.get_daily_return(&params.portfolio_id, date).await {
         Ok(Some(return_value)) => {
             // Cache the result
-            state.cache.cache_daily_return(&params.portfolio_id, date, return_value).await;
-            
+            state
+                .cache
+                .cache_daily_return(&params.portfolio_id, date, return_value)
+                .await;
+
             let response_time = start_time.elapsed();
             info!(
                 "Daily return calculated: {} on {} = {:.4} ({}ms)",
-                params.portfolio_id, params.date, return_value, response_time.as_millis()
+                params.portfolio_id,
+                params.date,
+                return_value,
+                response_time.as_millis()
             );
 
             Ok(Json(DailyReturnResponse {
@@ -260,7 +285,10 @@ pub async fn get_daily_return(
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!("No return data found for portfolio {} on {}", params.portfolio_id, params.date),
+                error: format!(
+                    "No return data found for portfolio {} on {}",
+                    params.portfolio_id, params.date
+                ),
                 code: "NOT_FOUND".to_string(),
             }),
         )),
@@ -283,7 +311,7 @@ pub async fn get_cumulative_return(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CumulativeReturnResponse>, (StatusCode, Json<ErrorResponse>)> {
     let start_time = std::time::Instant::now();
-    
+
     let start_date = match parse_date(&params.start_date) {
         Ok(d) => d,
         Err(e) => {
@@ -321,7 +349,10 @@ pub async fn get_cumulative_return(
     }
 
     // Check cache first
-    let cache_key = format!("cumulative_return_{}_{}_{}", params.portfolio_id, start_date, end_date);
+    let cache_key = format!(
+        "cumulative_return_{}_{}_{}",
+        params.portfolio_id, start_date, end_date
+    );
     if let Some(cumulative_return) = state.cache.get_l2_calculation(&cache_key).await {
         debug!("Cache hit for cumulative return: {}", cache_key);
         return Ok(Json(CumulativeReturnResponse {
@@ -330,38 +361,62 @@ pub async fn get_cumulative_return(
         }));
     }
 
-    // Fetch price series from database
-    match state.db.get_portfolio_price_series(&params.portfolio_id, start_date, end_date).await {
+    // Fetch price series from database (aggregated portfolio values)
+    match state
+        .db
+        .get_portfolio_price_series(&params.portfolio_id, start_date, end_date)
+        .await
+    {
         Ok(price_series) => {
             if price_series.is_empty() {
                 return Err((
                     StatusCode::NOT_FOUND,
                     Json(ErrorResponse {
-                        error: format!("No price data found for portfolio {} in date range", params.portfolio_id),
+                        error: format!(
+                            "No price data found for portfolio {} in date range",
+                            params.portfolio_id
+                        ),
                         code: "NOT_FOUND".to_string(),
                     }),
                 ));
             }
 
-            // Calculate cumulative return
-            let prices: Vec<f64> = price_series.iter().map(|(_, price)| *price).collect();
-            let returns = SIMDFinancialCalculator::daily_returns_simd(&prices);
-            
-            // Cumulative return = (final_price / initial_price) - 1
-            let cumulative_return = if prices.len() >= 2 {
-                (prices[prices.len() - 1] / prices[0]) - 1.0
+            // Calculate cumulative return: (final_value / initial_value) - 1
+            let cumulative_return = if price_series.len() >= 2 {
+                let initial_value = price_series[0].1;
+                let final_value = price_series[price_series.len() - 1].1;
+
+                if initial_value != 0.0 {
+                    (final_value / initial_value) - 1.0
+                } else {
+                    0.0
+                }
+            } else if price_series.len() == 1 {
+                0.0 // No change if only one data point
             } else {
-                0.0
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: "Insufficient data for cumulative return calculation".to_string(),
+                        code: "INSUFFICIENT_DATA".to_string(),
+                    }),
+                ));
             };
 
             // Cache the result
-            state.cache.cache_l2_calculation(cache_key, cumulative_return).await;
-            
+            state
+                .cache
+                .cache_l2_calculation(cache_key, cumulative_return)
+                .await;
+
             let response_time = start_time.elapsed();
             info!(
                 "Cumulative return calculated: {} ({} to {}) = {:.4} ({}ms)",
-                params.portfolio_id, params.start_date, params.end_date, 
-                cumulative_return, response_time.as_millis()
+                params.portfolio_id,
+                params.start_date,
+                params.end_date,
+                cumulative_return,
+                response_time.as_millis()
             );
 
             Ok(Json(CumulativeReturnResponse {
@@ -388,7 +443,7 @@ pub async fn get_daily_volatility(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<VolatilityResponse>, (StatusCode, Json<ErrorResponse>)> {
     let start_time = std::time::Instant::now();
-    
+
     let start_date = match parse_date(&params.start_date) {
         Ok(d) => d,
         Err(e) => {
@@ -426,7 +481,10 @@ pub async fn get_daily_volatility(
     }
 
     // Check cache first
-    let cache_key = format!("volatility_{}_{}_{}", params.portfolio_id, start_date, end_date);
+    let cache_key = format!(
+        "volatility_{}_{}_{}",
+        params.portfolio_id, start_date, end_date
+    );
     if let Some(cached_volatility) = state.cache.get_l1_volatility(&cache_key).await {
         debug!("Cache hit for volatility: {}", cache_key);
         return Ok(Json(VolatilityResponse {
@@ -436,7 +494,11 @@ pub async fn get_daily_volatility(
     }
 
     // Fetch price series and calculate volatility
-    match state.db.get_portfolio_price_series(&params.portfolio_id, start_date, end_date).await {
+    match state
+        .db
+        .get_portfolio_price_series(&params.portfolio_id, start_date, end_date)
+        .await
+    {
         Ok(price_series) => {
             if price_series.len() < 2 {
                 return Err((
@@ -448,18 +510,39 @@ pub async fn get_daily_volatility(
                 ));
             }
 
+            // Calculate returns and volatility using SIMD optimization
             let prices: Vec<f64> = price_series.iter().map(|(_, price)| *price).collect();
-            let returns = SIMDFinancialCalculator::daily_returns_simd(&prices);
-            let volatility = SIMDFinancialCalculator::volatility_optimized(&returns);
+            let (returns, volatility) = tokio::task::spawn_blocking(move || {
+                let returns = SIMDFinancialCalculator::daily_returns_simd(&prices);
+                let volatility = SIMDFinancialCalculator::volatility_optimized(&returns);
+                (returns, volatility)
+            })
+            .await
+            .map_err(|_| {
+                error!("CPU task panicked during volatility calculation");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Internal server error".to_string(),
+                        code: "CALCULATION_ERROR".to_string(),
+                    }),
+                )
+            })?;
 
             // Cache the result
-            state.cache.cache_volatility_keyed_async(&cache_key, volatility).await;
-            
+            state
+                .cache
+                .cache_volatility_keyed_async(&cache_key, volatility)
+                .await;
+
             let response_time = start_time.elapsed();
             info!(
                 "Volatility calculated: {} ({} to {}) = {:.4} ({}ms)",
-                params.portfolio_id, params.start_date, params.end_date, 
-                volatility, response_time.as_millis()
+                params.portfolio_id,
+                params.start_date,
+                params.end_date,
+                volatility,
+                response_time.as_millis()
             );
 
             Ok(Json(VolatilityResponse {
@@ -486,7 +569,7 @@ pub async fn get_correlation(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CorrelationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let start_time = std::time::Instant::now();
-    
+
     let start_date = match parse_date(&params.start_date) {
         Ok(d) => d,
         Err(e) => {
@@ -524,8 +607,10 @@ pub async fn get_correlation(
     }
 
     // Check cache first
-    let cache_key = format!("correlation_{}_{}_{}_{}", 
-        params.portfolio_id1, params.portfolio_id2, start_date, end_date);
+    let cache_key = format!(
+        "correlation_{}_{}_{}_{}",
+        params.portfolio_id1, params.portfolio_id2, start_date, end_date
+    );
     if let Some(cached_correlation) = state.cache.get_l1_correlation(&cache_key).await {
         debug!("Cache hit for correlation: {}", cache_key);
         return Ok(Json(CorrelationResponse {
@@ -536,7 +621,16 @@ pub async fn get_correlation(
     }
 
     // Fetch aligned price data for both portfolios
-    match state.db.get_aligned_price_series_parallel(&params.portfolio_id1, &params.portfolio_id2, start_date, end_date).await {
+    match state
+        .db
+        .get_aligned_price_series_parallel(
+            &params.portfolio_id1,
+            &params.portfolio_id2,
+            start_date,
+            end_date,
+        )
+        .await
+    {
         Ok((prices1, prices2)) => {
             if prices1.len() < 2 || prices2.len() < 2 {
                 return Err((
@@ -548,18 +642,39 @@ pub async fn get_correlation(
                 ));
             }
 
-            let returns1 = SIMDFinancialCalculator::daily_returns_simd(&prices1);
-            let returns2 = SIMDFinancialCalculator::daily_returns_simd(&prices2);
-            let correlation = SIMDFinancialCalculator::correlation_simd(&returns1, &returns2);
+            // Calculate correlation using SIMD optimization
+            let correlation = tokio::task::spawn_blocking(move || {
+                let returns1 = SIMDFinancialCalculator::daily_returns_simd(&prices1);
+                let returns2 = SIMDFinancialCalculator::daily_returns_simd(&prices2);
+                SIMDFinancialCalculator::correlation_simd(&returns1, &returns2)
+            })
+            .await
+            .map_err(|_| {
+                error!("CPU task panicked during correlation calculation");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Internal server error".to_string(),
+                        code: "CALCULATION_ERROR".to_string(),
+                    }),
+                )
+            })?;
 
             // Cache the result
-            state.cache.cache_correlation_keyed_async(&cache_key, correlation).await;
-            
+            state
+                .cache
+                .cache_correlation_keyed_async(&cache_key, correlation)
+                .await;
+
             let response_time = start_time.elapsed();
             info!(
                 "Correlation calculated: {} vs {} ({} to {}) = {:.4} ({}ms)",
-                params.portfolio_id1, params.portfolio_id2, params.start_date, params.end_date, 
-                correlation, response_time.as_millis()
+                params.portfolio_id1,
+                params.portfolio_id2,
+                params.start_date,
+                params.end_date,
+                correlation,
+                response_time.as_millis()
             );
 
             Ok(Json(CorrelationResponse {
@@ -587,7 +702,7 @@ pub async fn get_tracking_error(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<TrackingErrorResponse>, (StatusCode, Json<ErrorResponse>)> {
     let start_time = std::time::Instant::now();
-    
+
     let start_date = match parse_date(&params.start_date) {
         Ok(d) => d,
         Err(e) => {
@@ -624,9 +739,11 @@ pub async fn get_tracking_error(
         ));
     }
 
-    // Check cache first  
-    let cache_key = format!("tracking_error_{}_{}_{}_{}", 
-        params.portfolio_id, params.benchmark_id, start_date, end_date);
+    // Check cache first
+    let cache_key = format!(
+        "tracking_error_{}_{}_{}_{}",
+        params.portfolio_id, params.benchmark_id, start_date, end_date
+    );
     if let Some(tracking_error) = state.cache.get_l2_calculation(&cache_key).await {
         debug!("Cache hit for tracking error: {}", cache_key);
         return Ok(Json(TrackingErrorResponse {
@@ -637,7 +754,16 @@ pub async fn get_tracking_error(
     }
 
     // Fetch aligned data for portfolio and benchmark
-    match state.db.get_aligned_price_series_parallel(&params.portfolio_id, &params.benchmark_id, start_date, end_date).await {
+    match state
+        .db
+        .get_aligned_price_series_parallel(
+            &params.portfolio_id,
+            &params.benchmark_id,
+            start_date,
+            end_date,
+        )
+        .await
+    {
         Ok((portfolio_prices, benchmark_prices)) => {
             if portfolio_prices.len() < 2 || benchmark_prices.len() < 2 {
                 return Err((
@@ -649,18 +775,44 @@ pub async fn get_tracking_error(
                 ));
             }
 
-            let portfolio_returns = SIMDFinancialCalculator::daily_returns_simd(&portfolio_prices);
-            let benchmark_returns = SIMDFinancialCalculator::daily_returns_simd(&benchmark_prices);
-            let tracking_error = SIMDFinancialCalculator::tracking_error_optimized(&portfolio_returns, &benchmark_returns);
+            // Calculate tracking error using SIMD optimization
+            let tracking_error = tokio::task::spawn_blocking(move || {
+                let portfolio_returns =
+                    SIMDFinancialCalculator::daily_returns_simd(&portfolio_prices);
+                let benchmark_returns =
+                    SIMDFinancialCalculator::daily_returns_simd(&benchmark_prices);
+                SIMDFinancialCalculator::tracking_error_optimized(
+                    &portfolio_returns,
+                    &benchmark_returns,
+                )
+            })
+            .await
+            .map_err(|_| {
+                error!("CPU task panicked during tracking error calculation");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Internal server error".to_string(),
+                        code: "CALCULATION_ERROR".to_string(),
+                    }),
+                )
+            })?;
 
             // Cache the result
-            state.cache.cache_l2_calculation(cache_key, tracking_error).await;
-            
+            state
+                .cache
+                .cache_l2_calculation(cache_key, tracking_error)
+                .await;
+
             let response_time = start_time.elapsed();
             info!(
                 "Tracking error calculated: {} vs {} ({} to {}) = {:.4} ({}ms)",
-                params.portfolio_id, params.benchmark_id, params.start_date, params.end_date, 
-                tracking_error, response_time.as_millis()
+                params.portfolio_id,
+                params.benchmark_id,
+                params.start_date,
+                params.end_date,
+                tracking_error,
+                response_time.as_millis()
             );
 
             Ok(Json(TrackingErrorResponse {
