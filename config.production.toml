@@ -11,9 +11,10 @@ database = "postgres"
 username = "team9dbuser.jdcgkhwtrsdhyysagkwb"
 password = "e5ci7swfjroiqs4f"
 max_connections = 50
+min_connections = 5    
 connect_timeout = 30
-idle_timeout = 600
-max_lifetime = 1800
+idle_timeout = 3600
+max_lifetime = 7200
 ssl_mode = "require"
 
 [performance]
