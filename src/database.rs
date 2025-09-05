@@ -106,36 +106,15 @@ impl Database {
             .username(&config.database.username)
             .password(&config.database.password)
             .database(&config.database.database)
-            .application_name("nuclear_risk_api")
-            .statement_cache_capacity(5000)
-            .options([
-                ("tcp_nodelay", "true"),
-                ("tcp_user_timeout", "5000"),
-                ("statement_timeout", "30s"),
-                ("idle_in_transaction_session_timeout", "10s"),
-            ]);
+            .ssl_mode(sqlx::postgres::PgSslMode::Require);
 
         let pool = PgPoolOptions::new()
-            .max_connections(80)
-            .min_connections(40)
-            .acquire_timeout(Duration::from_millis(100))
+            .max_connections(config.database.max_connections)
+            .min_connections(config.database.min_connections)
+            .acquire_timeout(Duration::from_millis(config.database.connection_timeout_ms))
             .idle_timeout(Duration::from_secs(300))
             .max_lifetime(Duration::from_secs(1800))
             .test_before_acquire(false)
-            .after_connect(|conn, _meta| {
-                Box::pin(async move {
-                    sqlx::query("SET enable_seqscan = off")
-                        .execute(&mut *conn)
-                        .await?;
-                    sqlx::query("SET enable_hashjoin = on")
-                        .execute(&mut *conn)
-                        .await?;
-                    sqlx::query("SET work_mem = '64MB'")
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                })
-            })
             .connect_with(connect_options)
             .await
             .context("Failed to create database connection pool")?;
@@ -154,20 +133,67 @@ impl Database {
         })
     }
 
-    /// Get portfolio price by aggregating holdings * instrument prices
+    /// Get portfolio price - handles both leaf and summary portfolios
     pub async fn get_portfolio_price(
         &self,
         portfolio_id: &str,
         date: NaiveDate,
     ) -> Result<Option<f64>> {
-        let result = sqlx::query_scalar(self.queries.portfolio_price)
-            .bind(portfolio_id)
-            .bind(date)
-            .fetch_optional(&self.pool)
-            .await
-            .context("Failed to fetch portfolio price")?;
+        // Parse portfolio_id as integer
+        let portfolio_id_int: i32 = portfolio_id.parse()
+            .map_err(|_| anyhow::anyhow!("Invalid portfolio ID format"))?;
+        
+        // First check if this is a leaf or summary portfolio
+        let portfolio_info = sqlx::query_as::<_, (i32, String, Option<i32>)>(
+            "SELECT portfolio_id, portfolio_type, parent_portfolio_id FROM portfolios WHERE portfolio_id = $1"
+        )
+        .bind(portfolio_id_int)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to fetch portfolio info")?;
 
-        Ok(result)
+        match portfolio_info {
+            Some((_, portfolio_type, _)) => {
+                if portfolio_type.to_lowercase() == "leaf" {
+                    // Calculate from direct holdings
+                    let result = sqlx::query_scalar(self.queries.portfolio_price)
+                        .bind(portfolio_id_int)
+                        .bind(date)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .context("Failed to fetch leaf portfolio price")?;
+                    Ok(result)
+                } else {
+                    // Summary portfolio - sum child portfolio prices recursively
+                    let child_price = self.get_summary_portfolio_price(portfolio_id_int, date).await?;
+                    Ok(Some(child_price))
+                }
+            }
+            None => Ok(None) // Portfolio not found
+        }
+    }
+
+    /// Calculate summary portfolio price by summing child portfolios recursively
+    fn get_summary_portfolio_price<'a>(&'a self, portfolio_id: i32, date: NaiveDate) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<f64>> + Send + 'a>> {
+        Box::pin(async move {
+            let child_portfolios = sqlx::query_as::<_, (i32,)>(
+                "SELECT portfolio_id FROM portfolios WHERE parent_portfolio_id = $1"
+            )
+            .bind(portfolio_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to fetch child portfolios")?;
+
+            let mut total_price = 0.0;
+            
+            for (child_id,) in child_portfolios {
+                if let Some(child_price) = self.get_portfolio_price(&child_id.to_string(), date).await? {
+                    total_price += child_price;
+                }
+            }
+
+            Ok(total_price)
+        })
     }
 
     /// Get portfolio price series over date range
@@ -179,8 +205,12 @@ impl Database {
     ) -> Result<Vec<(NaiveDate, f64)>> {
         use futures::TryStreamExt;
 
+        // Parse portfolio_id as integer
+        let portfolio_id_int: i32 = portfolio_id.parse()
+            .map_err(|_| anyhow::anyhow!("Invalid portfolio ID format"))?;
+
         let mut rows = sqlx::query(self.queries.portfolio_price_series)
-            .bind(portfolio_id)
+            .bind(portfolio_id_int)
             .bind(start_date)
             .bind(end_date)
             .fetch(&self.pool);
@@ -203,20 +233,57 @@ impl Database {
         Ok(price_series)
     }
 
-    /// Get daily return using portfolio valuation
+    /// Get daily return with proper previous date handling
     pub async fn get_daily_return(
         &self,
         portfolio_id: &str,
         date: NaiveDate,
     ) -> Result<Option<f64>> {
-        let result = sqlx::query_scalar(self.queries.daily_return_optimized)
-            .bind(portfolio_id)
+        // Parse portfolio_id as integer
+        let portfolio_id_int: i32 = portfolio_id.parse()
+            .map_err(|_| anyhow::anyhow!("Invalid portfolio ID format"))?;
+        
+        // Get current day's price
+        let current_price = match self.get_portfolio_price(portfolio_id, date).await? {
+            Some(price) => price,
+            None => return Ok(None), // No data for current date
+        };
+
+        // Get the latest available price before the current date
+        let previous_price_query = r#"
+            WITH portfolio_prices AS (
+                SELECT h.date, SUM(h.quantity * p.closing_price) as total_value
+                FROM holdings h
+                JOIN prices p ON h.symbol = p.symbol AND h.date = p.date
+                JOIN portfolios pf ON h.portfolio_id = pf.portfolio_id
+                WHERE h.portfolio_id = $1 AND h.date < $2
+                  AND pf.portfolio_type = 'leaf'
+                GROUP BY h.date
+                UNION ALL
+                -- For summary portfolios, we need recursive calculation
+                SELECT $2::date - 1 as date, 0.0 as total_value WHERE FALSE
+            )
+            SELECT total_value
+            FROM portfolio_prices
+            WHERE total_value IS NOT NULL
+            ORDER BY date DESC
+            LIMIT 1
+        "#;
+
+        let previous_price: Option<f64> = sqlx::query_scalar(previous_price_query)
+            .bind(portfolio_id_int)
             .bind(date)
             .fetch_optional(&self.pool)
             .await
-            .context("Failed to calculate daily return")?;
+            .context("Failed to fetch previous price")?;
 
-        Ok(result.flatten())
+        match previous_price {
+            Some(prev_price) if prev_price != 0.0 => {
+                let daily_return = (current_price - prev_price) / prev_price;
+                Ok(Some(daily_return))
+            },
+            _ => Ok(None), // No previous price available or previous price is zero
+        }
     }
 
     /// Get aligned portfolio data for correlation and tracking error calculations
@@ -229,9 +296,15 @@ impl Database {
     ) -> Result<(Vec<f64>, Vec<f64>)> {
         use futures::TryStreamExt;
 
+        // Parse portfolio IDs as integers
+        let portfolio_id1_int: i32 = portfolio_id1.parse()
+            .map_err(|_| anyhow::anyhow!("Invalid portfolio ID format"))?;
+        let portfolio_id2_int: i32 = portfolio_id2.parse()
+            .map_err(|_| anyhow::anyhow!("Invalid portfolio ID format"))?;
+
         let mut rows = sqlx::query(self.queries.aligned_portfolios)
-            .bind(portfolio_id1)
-            .bind(portfolio_id2)
+            .bind(portfolio_id1_int)
+            .bind(portfolio_id2_int)
             .bind(start_date)
             .bind(end_date)
             .fetch(&self.pool);
@@ -287,7 +360,7 @@ impl Database {
     pub async fn health_check(&self) -> Result<HealthStats> {
         let start = std::time::Instant::now();
 
-        let _: (i64,) = sqlx::query_as("SELECT 1")
+        let _: i32 = sqlx::query_scalar("SELECT 1")
             .fetch_one(&self.pool)
             .await
             .context("Database health check failed")?;
@@ -335,8 +408,12 @@ impl Database {
                 "#
             );
 
+            // Parse portfolio_id as integer
+            let portfolio_id_int: i32 = portfolio_id.parse()
+                .map_err(|_| anyhow::anyhow!("Invalid portfolio ID format"))?;
+
             let mut rows = sqlx::query(&query)
-                .bind(portfolio_id)
+                .bind(portfolio_id_int)
                 .bind(last_date)
                 .bind(end_date)
                 .bind(chunk_size)
@@ -388,13 +465,13 @@ impl Database {
 
         let query = r#"
             SELECT date, bmk_returns
-            FROM benchmark
+            FROM benchmarks
             WHERE bmk_id = $1 AND date BETWEEN $2 AND $3
             ORDER BY date
         "#;
 
         let mut rows = sqlx::query(query)
-            .bind(benchmark_id)
+            .bind(benchmark_id.parse::<i32>().unwrap_or(0))
             .bind(start_date)
             .bind(end_date)
             .fetch(&self.pool);
@@ -414,12 +491,44 @@ impl Database {
         Ok(benchmark_series)
     }
 
+    /// Get benchmark returns as portfolio-like returns for tracking error
+    pub async fn get_benchmark_returns(
+        &self,
+        benchmark_id: &str,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<Vec<f64>> {
+        let benchmark_series = self.get_benchmark_series(benchmark_id, start_date, end_date).await?;
+        
+        if benchmark_series.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        // Convert benchmark values to returns (bmk_returns are values, not returns)
+        let mut returns = Vec::new();
+        for i in 1..benchmark_series.len() {
+            let prev_value = benchmark_series[i - 1].1;
+            let curr_value = benchmark_series[i].1;
+            
+            if prev_value != 0.0 {
+                let return_val = (curr_value - prev_value) / prev_value;
+                returns.push(return_val);
+            }
+        }
+
+        Ok(returns)
+    }
+
     /// Get portfolio details for validation
     pub async fn get_portfolio_info(&self, portfolio_id: &str) -> Result<Option<PortfolioInfo>> {
+        // Parse portfolio_id as integer
+        let portfolio_id_int: i32 = portfolio_id.parse()
+            .map_err(|_| anyhow::anyhow!("Invalid portfolio ID format"))?;
+
         let result = sqlx::query_as::<_, PortfolioInfo>(
             "SELECT portfolio_id, portfolio_name, portfolio_type FROM portfolios WHERE portfolio_id = $1"
         )
-        .bind(portfolio_id)
+        .bind(portfolio_id_int)
         .fetch_optional(&self.pool)
         .await
         .context("Failed to fetch portfolio info")?;

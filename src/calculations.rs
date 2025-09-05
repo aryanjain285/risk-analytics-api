@@ -39,38 +39,34 @@ impl SIMDFinancialCalculator {
         returns
     }
 
-    /// Lightning-fast volatility calculation - one-pass algorithm
+    /// Daily volatility calculation using sample standard deviation formula
     #[inline(always)]
     pub fn volatility_optimized(returns: &[f64]) -> f64 {
-        let n = returns.len() as f64;
-        if n < 2.0 {
+        let n = returns.len();
+        if n < 2 {
             return 0.0;
         }
 
-        // One-pass parallel variance calculation
-        let (sum, sumsq) = if returns.len() > 50_000 {
-            returns.par_chunks(1 << 15).map(|chunk| {
-                let mut s = 0.0;
-                let mut ss = 0.0;
-                for &x in chunk {
-                    s += x;
-                    ss += x * x;
-                }
-                (s, ss)
-            }).reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1))
+        // Calculate mean
+        let mean = if returns.len() > 50_000 {
+            returns.par_iter().sum::<f64>() / n as f64
         } else {
-            let mut s = 0.0;
-            let mut ss = 0.0;
-            for &x in returns {
-                s += x;
-                ss += x * x;
-            }
-            (s, ss)
+            returns.iter().sum::<f64>() / n as f64
         };
 
-        let mean = sum / n;
-        let variance = (sumsq / n) - mean * mean;
-        variance.max(0.0).sqrt() * 252.0f64.sqrt()
+        // Calculate sample variance using (N-1) denominator
+        let variance = if returns.len() > 50_000 {
+            returns.par_iter()
+                .map(|&r| (r - mean).powi(2))
+                .sum::<f64>() / (n - 1) as f64
+        } else {
+            returns.iter()
+                .map(|&r| (r - mean).powi(2))
+                .sum::<f64>() / (n - 1) as f64
+        };
+
+        // Return daily volatility (sample standard deviation)
+        variance.max(0.0).sqrt()
     }
 
     /// Ultra-fast correlation with SIMD operations
@@ -123,18 +119,26 @@ impl SIMDFinancialCalculator {
         }
     }
 
-    /// SIMD-vectorized correlation calculation
+    /// Correlation calculation using exact formula from requirements
     fn correlation_simd_vectorized(returns1: &[f64], returns2: &[f64]) -> f64 {
-        let n = returns1.len() as f64;
-        
-        let sum1: f64 = returns1.iter().sum();
-        let sum2: f64 = returns2.iter().sum();
-        let sum1_sq: f64 = returns1.iter().map(|x| x * x).sum();
-        let sum2_sq: f64 = returns2.iter().map(|x| x * x).sum();
-        let sum_prod: f64 = returns1.iter().zip(returns2.iter()).map(|(x, y)| x * y).sum();
+        let n = returns1.len();
+        if n == 0 {
+            return 0.0;
+        }
 
-        let numerator = n * sum_prod - sum1 * sum2;
-        let denominator = ((n * sum1_sq - sum1 * sum1) * (n * sum2_sq - sum2 * sum2)).sqrt();
+        // Calculate means
+        let mean1 = returns1.iter().sum::<f64>() / n as f64;
+        let mean2 = returns2.iter().sum::<f64>() / n as f64;
+
+        // Calculate correlation using the exact formula from requirements
+        let numerator: f64 = returns1.iter().zip(returns2.iter())
+            .map(|(&x, &y)| (x - mean1) * (y - mean2))
+            .sum();
+
+        let sum_sq1: f64 = returns1.iter().map(|&x| (x - mean1).powi(2)).sum();
+        let sum_sq2: f64 = returns2.iter().map(|&x| (x - mean2).powi(2)).sum();
+        
+        let denominator = (sum_sq1 * sum_sq2).sqrt();
 
         if denominator == 0.0 {
             0.0
@@ -143,38 +147,33 @@ impl SIMDFinancialCalculator {
         }
     }
 
-    /// Tracking error without building excess_returns vector
+    /// Tracking error using sample standard deviation formula
     #[inline(always)]
     pub fn tracking_error_optimized(portfolio_returns: &[f64], benchmark_returns: &[f64]) -> f64 {
         if portfolio_returns.len() != benchmark_returns.len() || portfolio_returns.is_empty() {
             return 0.0;
         }
 
-        let n = portfolio_returns.len() as f64;
-        if n < 2.0 {
+        let n = portfolio_returns.len();
+        if n < 2 {
             return 0.0;
         }
 
-        // Calculate variance of excess returns directly without temp vector
-        let (sum, sumsq) = if portfolio_returns.len() > 50_000 {
-            portfolio_returns.par_iter().zip(benchmark_returns.par_iter()).map(|(&p, &b)| {
-                let excess = p - b;
-                (excess, excess * excess)
-            }).reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1))
-        } else {
-            let mut s = 0.0;
-            let mut ss = 0.0;
-            for (&p, &b) in portfolio_returns.iter().zip(benchmark_returns.iter()) {
-                let excess = p - b;
-                s += excess;
-                ss += excess * excess;
-            }
-            (s, ss)
-        };
+        // Calculate active returns (excess returns vs benchmark)
+        let active_returns: Vec<f64> = portfolio_returns.iter().zip(benchmark_returns.iter())
+            .map(|(&p, &b)| p - b)
+            .collect();
 
-        let mean = sum / n;
-        let variance = (sumsq / n) - mean * mean;
-        variance.max(0.0).sqrt() * 252.0f64.sqrt()
+        // Calculate mean of active returns
+        let mean_active = active_returns.iter().sum::<f64>() / n as f64;
+
+        // Calculate sample variance of active returns using (N-1) denominator
+        let variance = active_returns.iter()
+            .map(|&excess| (excess - mean_active).powi(2))
+            .sum::<f64>() / (n - 1) as f64;
+
+        // Return tracking error (sample standard deviation)
+        variance.max(0.0).sqrt()
     }
 
     /// Cumulative return calculation - handles massive time series
@@ -194,21 +193,34 @@ impl SIMDFinancialCalculator {
         }
     }
 
-    /// Cumulative return from price vector (for handlers)
+    /// Cumulative return using compound return formula: Π(1+Rp,ti) - 1
     #[inline(always)]
     pub fn cumulative_return_from_prices(prices: &[f64]) -> f64 {
         if prices.len() < 2 {
             return 0.0;
         }
 
-        let start_price = prices[0];
-        let end_price = prices[prices.len() - 1];
+        // Calculate daily returns first
+        let daily_returns = Self::daily_returns_simd(prices);
+        
+        // Calculate cumulative return using compound formula
+        Self::cumulative_return_from_returns(&daily_returns)
+    }
 
-        if start_price != 0.0 {
-            (end_price - start_price) / start_price
-        } else {
-            0.0
+    /// Calculate cumulative return from daily returns using compound formula
+    #[inline(always)]
+    pub fn cumulative_return_from_returns(returns: &[f64]) -> f64 {
+        if returns.is_empty() {
+            return 0.0;
         }
+
+        // Use compound return formula: Π(1+Ri) - 1
+        let mut cumulative = 1.0;
+        for &return_val in returns {
+            cumulative *= (1.0 + return_val);
+        }
+        
+        cumulative - 1.0
     }
 
     /// Memory-efficient streaming calculations for massive datasets

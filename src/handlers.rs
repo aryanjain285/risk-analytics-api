@@ -457,63 +457,88 @@ pub async fn nuclear_tracking_error(
         query.portfolio_id, query.benchmark_id, query.start_date, query.end_date
     );
 
-    // Fetch aligned data for portfolio and benchmark
-    match state
+    // Fetch portfolio price series
+    let portfolio_series = match state
         .db
-        .get_aligned_price_series_parallel(
-            &query.portfolio_id,
-            &query.benchmark_id,
-            query.start_date,
-            query.end_date,
-        )
+        .get_portfolio_price_series(&query.portfolio_id, query.start_date, query.end_date)
         .await
     {
-        Ok((portfolio_prices, benchmark_prices)) if portfolio_prices.len() >= 2 => {
-            // SIMD-optimized tracking error calculation offloaded to thread pool
-            let tracking_error = tokio::task::spawn_blocking(move || {
-                let portfolio_returns = SIMDFinancialCalculator::daily_returns_simd(&portfolio_prices);
-                let benchmark_returns = SIMDFinancialCalculator::daily_returns_simd(&benchmark_prices);
-                SIMDFinancialCalculator::tracking_error_optimized(
-                    &portfolio_returns,
-                    &benchmark_returns,
-                )
-            }).await.map_err(|_| {
-                error!("CPU task panicked during tracking error calculation");
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
-                }))
-            })?;
-
-            debug!("📊 Tracking error calculated: {}", tracking_error);
-            Ok(Json(TrackingErrorResponse {
-                portfolio_id: query.portfolio_id,
-                benchmark_id: query.benchmark_id,
-                tracking_error,
-            }))
-        }
+        Ok(series) if series.len() >= 2 => series,
         Ok(_) => {
-            warn!(
-                "Insufficient data for tracking error: {} vs {}",
-                query.portfolio_id, query.benchmark_id
-            );
-            Err((
+            warn!("Insufficient portfolio data for tracking error: {}", query.portfolio_id);
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: "Insufficient overlapping data for tracking error calculation"
-                        .to_string(),
+                    error: "Insufficient portfolio data for tracking error calculation".to_string(),
                 }),
-            ))
+            ));
         }
         Err(e) => {
-            error!("Database error in tracking error query: {}", e);
-            Err((
+            error!("Database error fetching portfolio data: {}", e);
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: "Internal server error".to_string(),
                 }),
-            ))
+            ));
         }
-    }
+    };
+
+    // Fetch benchmark returns
+    let benchmark_returns = match state
+        .db
+        .get_benchmark_returns(&query.benchmark_id, query.start_date, query.end_date)
+        .await
+    {
+        Ok(returns) if !returns.is_empty() => returns,
+        Ok(_) => {
+            warn!("Insufficient benchmark data: {}", query.benchmark_id);
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Insufficient benchmark data for tracking error calculation".to_string(),
+                }),
+            ));
+        }
+        Err(e) => {
+            error!("Database error fetching benchmark data: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // Calculate portfolio returns and tracking error
+    let tracking_error = tokio::task::spawn_blocking(move || {
+        let portfolio_prices: Vec<f64> = portfolio_series.iter().map(|(_, price)| *price).collect();
+        let portfolio_returns = SIMDFinancialCalculator::daily_returns_simd(&portfolio_prices);
+        
+        // Ensure we have matching return periods
+        let min_len = portfolio_returns.len().min(benchmark_returns.len());
+        if min_len == 0 {
+            return 0.0;
+        }
+        
+        SIMDFinancialCalculator::tracking_error_optimized(
+            &portfolio_returns[..min_len],
+            &benchmark_returns[..min_len],
+        )
+    }).await.map_err(|_| {
+        error!("CPU task panicked during tracking error calculation");
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: "Internal server error".to_string(),
+        }))
+    })?;
+
+    debug!("📊 Tracking error calculated: {}", tracking_error);
+    Ok(Json(TrackingErrorResponse {
+        portfolio_id: query.portfolio_id,
+        benchmark_id: query.benchmark_id,
+        tracking_error,
+    }))
 }
 
 /// Performance metrics endpoint for monitoring
